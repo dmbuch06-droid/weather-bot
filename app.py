@@ -9,7 +9,6 @@ app = Flask(__name__)
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1534781924252323891/7hm54rbQchA2idRvqEoi6j6grqqk7Wx48CBMWqbKwRJdn2vxkfZ9II1d1pCX1IXNbD2R"
 
-# Target cities mapped with coordinates and tracking history storage
 CITY_COORDS = {
     "KXHIGHNYC": {"name": "New York", "lat": 40.7128, "lon": -74.0060},
     "KXHIGHCHI": {"name": "Chicago", "lat": 41.8781, "lon": -87.6298},
@@ -17,7 +16,6 @@ CITY_COORDS = {
     "KXHIGHAUS": {"name": "Austin", "lat": 30.2672, "lon": -97.7431},
 }
 
-# In-memory storage to track previous forecast temperatures for shift detection
 previous_forecasts = {}
 
 def send_discord_alert(message):
@@ -27,10 +25,6 @@ def send_discord_alert(message):
         print(f"Discord webhook error: {e}")
 
 def get_hrrr_forecast_temp(lat, lon):
-    """
-    Queries Open-Meteo using the HRRR Conus high-resolution model endpoint 
-    to extract today's forecast maximum temperature.
-    """
     try:
         url = f"https://api.open-meteo.com/v1/gfs?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&models=hrrr_conus&timezone=auto"
         res = requests.get(url, timeout=10)
@@ -41,7 +35,6 @@ def get_hrrr_forecast_temp(lat, lon):
     except Exception as e:
         print(f"HRRR Weather API error: {e}")
     
-    # Fallback to standard multi-model forecast if HRRR is unreachable
     try:
         fallback_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
         res = requests.get(fallback_url, timeout=10)
@@ -77,7 +70,7 @@ def run_arbitrage_scan():
     for market in weather_markets:
         ticker = market.get("ticker")
         title = market.get("title", "")
-        yes_bid = market.get("yes_bid", 0)
+        event_ticker = market.get("event_ticker", ticker)
         yes_ask = market.get("yes_ask", 0)
         
         matched_city = None
@@ -95,38 +88,32 @@ def run_arbitrage_scan():
         if forecast_temp is None:
             continue
 
-        # Check for projection shifts compared to previous scan
         city_name = matched_city["name"]
         old_forecast = previous_forecasts.get(prefix_key)
-        shift_detected = False
+        shift_detected = (old_forecast is not None and old_forecast != forecast_temp)
         
-        if old_forecast is not None and old_forecast != forecast_temp:
-            shift_detected = True
-        
-        # Update stored forecast for next cycle
         previous_forecasts[prefix_key] = forecast_temp
 
-        # Dynamic +EV Calculation across price points
         implied_prob = yes_ask / 100.0
-        model_prob = 0.68 if forecast_temp else 0.50  # Estimated confidence when model updates
+        model_prob = 0.68 if forecast_temp else 0.50
         expected_value_edge = (model_prob - implied_prob) * 100
 
-        # Trigger notification if positive EV edge exceeds threshold
         if expected_value_edge > 1.5:
-            # Dynamic ceiling calculation based on true model probability
             max_viable_cents = int(model_prob * 100)
             
-            shift_text = ""
             if shift_detected:
-                shift_text = f"Projected temperature in {city_name} shifted from {old_forecast}°F to {forecast_temp}°F. "
+                shift_text = f"Projected temperature in {city_name} shifted from {old_forecast}°F to {forecast_temp}°F."
             else:
-                shift_text = f"Projected temperature in {city_name} is steady at {forecast_temp}°F. "
+                shift_text = f"Projected temperature in {city_name} is steady at {forecast_temp}°F."
+
+            kalshi_link = f"https://kalshi.com/markets/{event_ticker.lower()}"
 
             alert_text = (
                 f"🎯 **+EV PAPER TRADE SIGNAL** 🎯\n"
-                f"• {shift_text}Bet of {int(forecast_temp)}+ is a plus EV bet up to {max_viable_cents} cents.\n"
+                f"• {shift_text} Bet of {int(forecast_temp)}+ is a plus EV bet up to {max_viable_cents} cents.\n"
                 f"• **Contract:** `{ticker}` ({title})\n"
-                f"• **Execution Ask:** {yes_ask}¢ | **Model Edge:** +{expected_value_edge:.1f}%"
+                f"• **Execution Ask:** {yes_ask}¢ | **Model Edge:** +{expected_value_edge:.1f}%\n"
+                f"• **Trade on Kalshi:** {kalshi_link}"
             )
             print(alert_text)
             send_discord_alert(alert_text)
@@ -140,12 +127,11 @@ def background_scanner():
         except Exception as e:
             print(f"Error in background scan loop: {e}")
         
-        # Scan every 5 minutes
         time.sleep(300)
 
 @app.route("/")
 def home():
-    return "HRRR Weather Arbitrage Bot is active and scanning every 5 minutes!"
+    return "HRRR Weather Arbitrage Bot with direct Kalshi links is active!"
 
 if __name__ == "__main__":
     scanner_thread = threading.Thread(target=background_scanner, daemon=True)
