@@ -47,15 +47,15 @@ def get_hrrr_forecast_temp(lat, lon):
     
     return None
 
-def fetch_kalshi_markets():
+def fetch_kalshi_events():
     try:
-        # Filter explicitly by series root to capture all open future and current weather contracts
-        url = f"{KALSHI_API_URL}/markets?status=open&series_ticker=KXHIGH"
+        # Querying events filtered by series_ticker to capture all future/current dates
+        url = f"{KALSHI_API_URL}/events?status=open&series_ticker=KXHIGH"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
-            markets = res.json().get("markets", [])
-            print(f"Kalshi API successfully returned {len(markets)} weather markets.")
-            return markets
+            events = res.json().get("events", [])
+            print(f"Kalshi API successfully returned {len(events)} weather event groups.")
+            return events
         else:
             print(f"Kalshi API returned status code {res.status_code}: {res.text}")
     except Exception as e:
@@ -64,64 +64,71 @@ def fetch_kalshi_markets():
 
 def run_arbitrage_scan():
     print("--- Running HRRR + Kalshi +EV Arbitrage Scan ---")
-    markets = fetch_kalshi_markets()
+    events = fetch_kalshi_events()
     
-    if not markets:
-        print("No active markets returned from Kalshi.")
+    if not events:
+        print("No active weather events returned from Kalshi.")
         return
 
-    for market in markets:
-        ticker = market.get("ticker", "")
-        title = market.get("title", "")
-        event_ticker = market.get("event_ticker", ticker)
-        yes_ask = market.get("yes_ask", 0)
-        
-        matched_city = None
-        prefix_key = None
-        for prefix in CITY_COORDS.keys():
-            if prefix in ticker:
-                matched_city = CITY_COORDS[prefix]
-                prefix_key = prefix
-                break
-        
-        if not matched_city or yes_ask <= 0:
-            continue
+    total_markets_analyzed = 0
 
-        forecast_temp = get_hrrr_forecast_temp(matched_city["lat"], matched_city["lon"])
-        if forecast_temp is None:
-            continue
-
-        city_name = matched_city["name"]
-        old_forecast = previous_forecasts.get(prefix_key)
-        shift_detected = (old_forecast is not None and old_forecast != forecast_temp)
-        
-        previous_forecasts[prefix_key] = forecast_temp
-
-        implied_prob = yes_ask / 100.0
-        model_prob = 0.68 if forecast_temp else 0.50
-        expected_value_edge = (model_prob - implied_prob) * 100
-
-        if expected_value_edge > 1.5:
-            max_viable_cents = int(model_prob * 100)
+    for event in events:
+        markets = event.get("markets", [])
+        for market in markets:
+            ticker = market.get("ticker", "")
+            title = market.get("title", "")
+            event_ticker = market.get("event_ticker", event.get("event_ticker", ticker))
+            yes_ask = market.get("yes_ask", 0)
             
-            if shift_detected:
-                shift_text = f"Projected temperature in {city_name} shifted from {old_forecast}°F to {forecast_temp}°F."
+            matched_city = None
+            prefix_key = None
+            for prefix in CITY_COORDS.keys():
+                if prefix in ticker:
+                    matched_city = CITY_COORDS[prefix]
+                    prefix_key = prefix
+                    break
+            
+            if not matched_city or yes_ask <= 0:
+                continue
+
+            total_markets_analyzed += 1
+            forecast_temp = get_hrrr_forecast_temp(matched_city["lat"], matched_city["lon"])
+            if forecast_temp is None:
+                continue
+
+            city_name = matched_city["name"]
+            old_forecast = previous_forecasts.get(prefix_key)
+            shift_detected = (old_forecast is not None and old_forecast != forecast_temp)
+            
+            previous_forecasts[prefix_key] = forecast_temp
+
+            implied_prob = yes_ask / 100.0
+            model_prob = 0.68 if forecast_temp else 0.50
+            expected_value_edge = (model_prob - implied_prob) * 100
+
+            if expected_value_edge > 1.5:
+                max_viable_cents = int(model_prob * 100)
+                
+                if shift_detected:
+                    shift_text = f"Projected temperature in {city_name} shifted from {old_forecast}°F to {forecast_temp}°F."
+                else:
+                    shift_text = f"Projected temperature in {city_name} is steady at {forecast_temp}°F."
+
+                kalshi_link = f"https://kalshi.com/markets/{event_ticker.lower()}"
+
+                alert_text = (
+                    f"🎯 **+EV PAPER TRADE SIGNAL** 🎯\n"
+                    f"• {shift_text} Bet of {int(forecast_temp)}+ is a plus EV bet up to {max_viable_cents} cents.\n"
+                    f"• **Contract:** `{ticker}` ({title})\n"
+                    f"• **Execution Ask:** {yes_ask}¢ | **Model Edge:** +{expected_value_edge:.1f}%\n"
+                    f"• **Trade on Kalshi:** {kalshi_link}"
+                )
+                print(alert_text)
+                send_discord_alert(alert_text)
             else:
-                shift_text = f"Projected temperature in {city_name} is steady at {forecast_temp}°F."
+                print(f"Checked {ticker} ({city_name}): HRRR {forecast_temp}°F | Ask: {yes_ask}¢ | Edge: {expected_value_edge:.1f}% (No trade)")
 
-            kalshi_link = f"https://kalshi.com/markets/{event_ticker.lower()}"
-
-            alert_text = (
-                f"🎯 **+EV PAPER TRADE SIGNAL** 🎯\n"
-                f"• {shift_text} Bet of {int(forecast_temp)}+ is a plus EV bet up to {max_viable_cents} cents.\n"
-                f"• **Contract:** `{ticker}` ({title})\n"
-                f"• **Execution Ask:** {yes_ask}¢ | **Model Edge:** +{expected_value_edge:.1f}%\n"
-                f"• **Trade on Kalshi:** {kalshi_link}"
-            )
-            print(alert_text)
-            send_discord_alert(alert_text)
-        else:
-            print(f"Checked {ticker} ({city_name}): HRRR {forecast_temp}°F | Ask: {yes_ask}¢ | Edge: {expected_value_edge:.1f}% (No trade)")
+    print(f"Scan complete. Evaluated {total_markets_analyzed} valid city temperature contracts.")
 
 def background_scanner():
     while True:
@@ -134,7 +141,7 @@ def background_scanner():
 
 @app.route("/")
 def home():
-    return "HRRR Weather Arbitrage Bot is active and scanning future markets!"
+    return "HRRR Weather Arbitrage Bot is active and scanning future events!"
 
 @app.route("/test-alert")
 def test_alert():
