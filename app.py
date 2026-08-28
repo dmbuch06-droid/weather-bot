@@ -9,7 +9,7 @@ app = Flask(__name__)
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 # PASTE YOUR NEW DISCORD WEBHOOK URL INSIDE THE QUOTES BELOW
-DISCORD_WEBHOOK_URL = "YOUR_NEW_DISCORD_WEBHOOK_URL"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1542727452948832306/wt5IXjBrc5VhNrzIJDdpyM58QsEbMGO2nPoYLhZvrfoEM1iSBIIW6-SYrJHujRd7zPYG"
 
 CITY_COORDS = {
     "NYC": {"name": "New York", "lat": 40.7128, "lon": -74.0060},
