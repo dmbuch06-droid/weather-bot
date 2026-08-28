@@ -3,8 +3,9 @@ import time
 import json
 import threading
 import statistics
+import re
+
 from datetime import datetime, timezone, date
-from collections import defaultdict
 
 import requests
 from flask import Flask, jsonify
@@ -19,32 +20,33 @@ app = Flask(__name__)
 # Kalshi public API
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Discord webhook MUST be stored as an environment variable.
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+# IMPORTANT:
+# Put this in Render Environment Variables.
+# DO NOT put your real webhook directly in this file.
+DISCORD_WEBHOOK_URL = os.environ.get(
+    "DISCORD_WEBHOOK_URL",
+    ""
+).strip()
 
-# How often to scan, in seconds.
+# Scan interval in seconds.
 SCAN_INTERVAL_SECONDS = int(
     os.environ.get("SCAN_INTERVAL_SECONDS", "300")
 )
 
-# Minimum temperature forecast movement before we consider it notable.
+# Minimum temperature movement required before we call it
+# a meaningful forecast change.
 MIN_TEMP_CHANGE_F = float(
     os.environ.get("MIN_TEMP_CHANGE_F", "1.0")
 )
 
-# Minimum precipitation movement before we consider it notable.
+# Minimum precipitation movement required.
 MIN_PRECIP_CHANGE_IN = float(
     os.environ.get("MIN_PRECIP_CHANGE_IN", "0.05")
 )
 
-# Minimum change in raw ensemble probability before considering it notable.
-MIN_PROBABILITY_CHANGE_POINTS = float(
-    os.environ.get("MIN_PROBABILITY_CHANGE_POINTS", "8.0")
-)
-
-# Minimum raw probability edge versus Kalshi ask.
+# Minimum raw ensemble probability edge over the market ask.
 MIN_EDGE_POINTS = float(
-    os.environ.get("MIN_EDGE_POINTS", "5.0")
+    os.environ.get("MIN_EDGE_POINTS", "8.0")
 )
 
 # Maximum number of days ahead to analyze.
@@ -52,15 +54,15 @@ MAX_FORECAST_DAYS_AHEAD = int(
     os.environ.get("MAX_FORECAST_DAYS_AHEAD", "3")
 )
 
-# State file.
+# State persistence file.
 STATE_FILE = "weather_bot_state.json"
 
-# This bot intentionally does NOT place real trades.
+# This bot does NOT place real trades.
 PAPER_TRADING_MODE = True
 
 
 # ============================================================
-# CITY / SERIES CONFIGURATION
+# CITY / KALSHI SERIES CONFIGURATION
 # ============================================================
 
 CITIES = {
@@ -107,7 +109,7 @@ bot_state = {
 
 
 # ============================================================
-# UTILITY FUNCTIONS
+# TIME / UTILITY FUNCTIONS
 # ============================================================
 
 def utc_now():
@@ -128,18 +130,28 @@ def load_state():
     global bot_state
 
     if not os.path.exists(STATE_FILE):
-        print("No previous state file found. Starting fresh.", flush=True)
+        print(
+            "No previous state file found. Starting fresh.",
+            flush=True
+        )
         return
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
             loaded = json.load(file)
 
         if isinstance(loaded, dict):
             with state_lock:
                 bot_state.update(loaded)
 
-        print("Previous state loaded successfully.", flush=True)
+        print(
+            "Previous state loaded successfully.",
+            flush=True
+        )
 
     except Exception as error:
         print(
@@ -151,31 +163,26 @@ def load_state():
 def save_state():
     try:
         with state_lock:
-            snapshot = json.loads(json.dumps(bot_state))
+            snapshot = json.loads(
+                json.dumps(bot_state)
+            )
 
-        with open(STATE_FILE, "w", encoding="utf-8") as file:
-            json.dump(snapshot, file, indent=2)
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                snapshot,
+                file,
+                indent=2
+            )
 
     except Exception as error:
         print(
             f"Could not save state: {error}",
             flush=True
         )
-
-
-def request_json(url, params=None, timeout=20):
-    headers = {
-        "User-Agent": "WeatherForecastResearchBot/1.0"
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        headers=headers,
-        timeout=timeout,
-    )
-
-    return response, response.json()
 
 
 # ============================================================
@@ -186,8 +193,9 @@ def send_discord_alert(message):
     if not DISCORD_WEBHOOK_URL:
         print(
             "Discord webhook not configured. "
-            "Set DISCORD_WEBHOOK_URL in Render environment variables.",
-            flush=True,
+            "Set DISCORD_WEBHOOK_URL in Render "
+            "Environment Variables.",
+            flush=True
         )
         return False
 
@@ -199,7 +207,8 @@ def send_discord_alert(message):
         )
 
         print(
-            f"Discord response: {response.status_code}",
+            f"Discord response status: "
+            f"{response.status_code}",
             flush=True
         )
 
@@ -223,14 +232,17 @@ def send_discord_alert(message):
 
 
 # ============================================================
-# WEATHER DATA
+# WEATHER: POINT FORECAST
 # ============================================================
 
 def get_point_forecast(city_data):
     """
-    Gets a deterministic point forecast from Open-Meteo.
+    Gets daily deterministic point forecasts.
 
-    This is treated as a forecast source, not a probability model.
+    Used for:
+    - forecast change detection
+    - precipitation monitoring
+    - diagnostic information
     """
 
     url = "https://api.open-meteo.com/v1/forecast"
@@ -256,13 +268,15 @@ def get_point_forecast(city_data):
         )
 
         print(
-            f"Point forecast status: {response.status_code}",
+            f"Point forecast status: "
+            f"{response.status_code}",
             flush=True
         )
 
         if response.status_code != 200:
             print(
-                f"Point forecast error: {response.text}",
+                f"Point forecast error: "
+                f"{response.text}",
                 flush=True
             )
             return {}
@@ -272,23 +286,31 @@ def get_point_forecast(city_data):
         daily = data.get("daily", {})
 
         dates = daily.get("time", [])
-        highs = daily.get("temperature_2m_max", [])
-        precipitation = daily.get("precipitation_sum", [])
+        highs = daily.get(
+            "temperature_2m_max",
+            []
+        )
+        precipitation = daily.get(
+            "precipitation_sum",
+            []
+        )
 
         forecasts = {}
 
         for index, forecast_date in enumerate(dates):
-            high = (
-                safe_float(highs[index])
-                if index < len(highs)
-                else None
-            )
 
-            precip = (
-                safe_float(precipitation[index])
-                if index < len(precipitation)
-                else None
-            )
+            high = None
+            precip = None
+
+            if index < len(highs):
+                high = safe_float(
+                    highs[index]
+                )
+
+            if index < len(precipitation):
+                precip = safe_float(
+                    precipitation[index]
+                )
 
             forecasts[forecast_date] = {
                 "high": high,
@@ -306,16 +328,27 @@ def get_point_forecast(city_data):
         return {}
 
 
+# ============================================================
+# WEATHER: ENSEMBLE FORECAST
+# ============================================================
+
 def get_ensemble_forecast(city_data):
     """
     Gets ensemble temperature forecasts.
 
     IMPORTANT:
-    The resulting probabilities are RAW ENSEMBLE FREQUENCIES,
-    not calibrated probabilities.
+
+    The probabilities calculated from this data are raw
+    ensemble frequencies.
+
+    They are NOT calibrated probabilities and should not be
+    interpreted as a guaranteed fair value estimate.
     """
 
-    url = "https://ensemble-api.open-meteo.com/v1/ensemble"
+    url = (
+        "https://ensemble-api.open-meteo.com/"
+        "v1/ensemble"
+    )
 
     params = {
         "latitude": city_data["lat"],
@@ -330,32 +363,42 @@ def get_ensemble_forecast(city_data):
         response = requests.get(
             url,
             params=params,
-            timeout=25,
+            timeout=30,
         )
 
         print(
-            f"Ensemble API status: {response.status_code}",
+            f"Ensemble API status: "
+            f"{response.status_code}",
             flush=True
         )
 
         if response.status_code != 200:
             print(
-                f"Ensemble error: {response.text}",
+                f"Ensemble API error: "
+                f"{response.text}",
                 flush=True
             )
             return {}
 
         data = response.json()
 
-        hourly = data.get("hourly", {})
+        hourly = data.get(
+            "hourly",
+            {}
+        )
 
-        times = hourly.get("time", [])
+        times = hourly.get(
+            "time",
+            []
+        )
 
-        temperature_keys = [
-            key
-            for key in hourly.keys()
-            if key.startswith("temperature_2m_member")
-        ]
+        temperature_keys = []
+
+        for key in hourly.keys():
+            if key.startswith(
+                "temperature_2m_member"
+            ):
+                temperature_keys.append(key)
 
         print(
             f"Ensemble member temperature keys found: "
@@ -365,75 +408,114 @@ def get_ensemble_forecast(city_data):
 
         if not temperature_keys:
             print(
-                "No ensemble member keys found.",
+                "No ensemble member temperature "
+                "keys found.",
                 flush=True
             )
             return {}
 
-        # Dictionary:
+        # Structure:
         #
-        # {
-        #   "2026-08-28": {
-        #       "member01": [temps...],
-        #       ...
-        #   }
+        # daily_members = {
+        #     "2026-08-28": {
+        #         "temperature_2m_member01": [...],
+        #         ...
+        #     }
         # }
-        member_daily_values = defaultdict(
-            lambda: defaultdict(list)
-        )
+
+        daily_members = {}
 
         for key in temperature_keys:
 
-            values = hourly.get(key, [])
+            values = hourly.get(
+                key,
+                []
+            )
 
             for index, timestamp in enumerate(times):
 
                 if index >= len(values):
                     continue
 
-                value = safe_float(values[index])
+                value = safe_float(
+                    values[index]
+                )
 
                 if value is None:
                     continue
 
                 forecast_date = timestamp[:10]
 
-                member_daily_values[
+                if forecast_date not in daily_members:
+                    daily_members[
+                        forecast_date
+                    ] = {}
+
+                if key not in daily_members[
+                    forecast_date
+                ]:
+                    daily_members[
+                        forecast_date
+                    ][key] = []
+
+                daily_members[
                     forecast_date
                 ][key].append(value)
 
         results = {}
 
-        for forecast_date, members in member_daily_values.items():
+        for forecast_date, members in (
+            daily_members.items()
+        ):
 
             member_highs = []
 
-            for member_name, temperatures in members.items():
+            for member_name, temperatures in (
+                members.items()
+            ):
 
                 if not temperatures:
                     continue
 
-                member_high = max(temperatures)
+                member_high = max(
+                    temperatures
+                )
 
-                member_highs.append(member_high)
+                member_highs.append(
+                    member_high
+                )
 
             if member_highs:
 
+                if len(member_highs) > 1:
+                    standard_deviation = (
+                        statistics.stdev(
+                            member_highs
+                        )
+                    )
+                else:
+                    standard_deviation = 0.0
+
                 results[forecast_date] = {
                     "member_highs": member_highs,
-                    "member_count": len(member_highs),
-                    "mean": statistics.mean(member_highs),
-                    "minimum": min(member_highs),
-                    "maximum": max(member_highs),
-                    "stdev": (
-                        statistics.stdev(member_highs)
-                        if len(member_highs) > 1
-                        else 0.0
+                    "member_count": len(
+                        member_highs
                     ),
+                    "mean": statistics.mean(
+                        member_highs
+                    ),
+                    "minimum": min(
+                        member_highs
+                    ),
+                    "maximum": max(
+                        member_highs
+                    ),
+                    "stdev": standard_deviation,
                 }
 
         print(
-            f"Ensemble dates available: {len(results)}",
+            f"Ensemble dates available: "
+            f"{len(results)}",
             flush=True
         )
 
@@ -441,7 +523,8 @@ def get_ensemble_forecast(city_data):
 
     except Exception as error:
         print(
-            f"Ensemble forecast error: {error}",
+            f"Ensemble forecast error: "
+            f"{error}",
             flush=True
         )
 
@@ -454,12 +537,12 @@ def get_ensemble_forecast(city_data):
 
 def fetch_kalshi_series(series_ticker):
     """
-    Fetches open markets for a specific Kalshi series.
+    Fetches open markets for one Kalshi series.
     """
 
-    possible_urls = [
-        f"{KALSHI_API_URL}/markets",
-    ]
+    url = (
+        f"{KALSHI_API_URL}/markets"
+    )
 
     params = {
         "series_ticker": series_ticker,
@@ -467,64 +550,74 @@ def fetch_kalshi_series(series_ticker):
         "limit": 1000,
     }
 
-    for url in possible_urls:
+    headers = {
+        "User-Agent":
+            "WeatherForecastResearchBot/1.0"
+    }
 
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=20,
-                headers={
-                    "User-Agent":
-                        "WeatherForecastResearchBot/1.0"
-                },
-            )
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=25,
+        )
 
+        print(
+            f"Kalshi {series_ticker} status: "
+            f"{response.status_code}",
+            flush=True
+        )
+
+        if response.status_code != 200:
             print(
-                f"Kalshi {series_ticker} status: "
-                f"{response.status_code}",
+                f"Kalshi error: "
+                f"{response.text}",
                 flush=True
             )
+            return []
 
-            if response.status_code != 200:
-                print(
-                    f"Kalshi error: {response.text}",
-                    flush=True
-                )
-                continue
+        data = response.json()
 
-            data = response.json()
+        markets = data.get(
+            "markets",
+            []
+        )
 
-            markets = data.get("markets", [])
+        print(
+            f"Markets found: {len(markets)}",
+            flush=True
+        )
 
-            print(
-                f"Markets found: {len(markets)}",
-                flush=True
-            )
+        return markets
 
-            return markets
+    except Exception as error:
+        print(
+            f"Kalshi request error: "
+            f"{error}",
+            flush=True
+        )
 
-        except Exception as error:
-            print(
-                f"Kalshi request error: {error}",
-                flush=True
-            )
-
-    return []
+        return []
 
 
 # ============================================================
-# KALSHI DATE PARSING
+# MARKET DATE PARSING
 # ============================================================
 
 def parse_market_date_from_ticker(ticker):
     """
-    Example ticker:
+    Example:
 
     KXHIGHCHI-26AUG28-T87
 
-    Interprets:
-    26AUG28 -> August 28, 2026
+    Date portion:
+
+    26AUG28
+
+    Returns:
+
+    2026-08-28
     """
 
     try:
@@ -542,7 +635,9 @@ def parse_market_date_from_ticker(ticker):
         month_text = date_part[2:5]
         day_text = date_part[5:7]
 
-        year = 2000 + int(year_text)
+        year = (
+            2000 + int(year_text)
+        )
 
         months = {
             "JAN": 1,
@@ -559,18 +654,20 @@ def parse_market_date_from_ticker(ticker):
             "DEC": 12,
         }
 
-        month = months.get(month_text.upper())
-
-        if not month:
-            return None
-
-        parsed_date = date(
-            year,
-            month,
-            int(day_text),
+        month = months.get(
+            month_text.upper()
         )
 
-        return parsed_date.isoformat()
+        if month is None:
+            return None
+
+        parsed = date(
+            year,
+            month,
+            int(day_text)
+        )
+
+        return parsed.isoformat()
 
     except Exception:
         return None
@@ -595,7 +692,8 @@ def date_is_in_range(date_string):
 
         return (
             days_ahead >= 0
-            and days_ahead <= MAX_FORECAST_DAYS_AHEAD
+            and days_ahead
+            <= MAX_FORECAST_DAYS_AHEAD
         )
 
     except Exception:
@@ -608,90 +706,18 @@ def date_is_in_range(date_string):
 
 def get_yes_ask_cents(market):
     """
-    Kalshi API fields can vary.
+    Returns YES ask in cents.
 
-    Try several possible representations.
+    Kalshi API representations can vary.
+
+    Examples:
+
+    yes_ask = 42
+    -> 42 cents
+
+    yes_ask_dollars = 0.42
+    -> 42 cents
     """
 
     yes_ask = safe_float(
-        market.get("yes_ask")
-    )
-
-    if yes_ask is not None:
-
-        if yes_ask <= 1:
-            return yes_ask * 100
-
-        return yes_ask
-
-    yes_ask_dollars = safe_float(
-        market.get("yes_ask_dollars")
-    )
-
-    if yes_ask_dollars is not None:
-        return yes_ask_dollars * 100
-
-    return None
-
-
-# ============================================================
-# CONTRACT INTERPRETATION
-# ============================================================
-
-def interpret_contract(market):
-    """
-    Returns a standardized interpretation.
-
-    The bot uses:
-    - strike_type
-    - floor_strike
-    - cap_strike
-    - yes_sub_title / yes_subtitle where available
-
-    IMPORTANT:
-    This interpretation should eventually be validated against
-    Kalshi's exact settlement rules for every market series.
-    """
-
-    strike_type = (
-        market.get("strike_type")
-        or ""
-    ).lower()
-
-    floor = safe_float(
-        market.get("floor_strike")
-    )
-
-    cap = safe_float(
-        market.get("cap_strike")
-    )
-
-    yes_subtitle = (
-        market.get("yes_sub_title")
-        or market.get("yes_subtitle")
-        or ""
-    )
-
-    title = (
-        market.get("title")
-        or ""
-    )
-
-    interpretation = None
-
-    if strike_type == "less":
-
-        if cap is not None:
-            interpretation = (
-                f"Below {cap:g}°F"
-            )
-
-        return {
-            "type": "less",
-            "floor": None,
-            "cap": cap,
-            "label": interpretation or title,
-            "yes_subtitle": yes_subtitle,
-        }
-
-    if strike_type == "greater
+        market
