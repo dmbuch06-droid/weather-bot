@@ -7,7 +7,9 @@ from flask import Flask
 app = Flask(__name__)
 
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1534781924252323891/7hm54rbQchA2idRvqEoi6j6grqqk7Wx48CBMWqbKwRJdn2vxkfZ9II1d1pCX1IXNbD2R"
+
+# PASTE YOUR NEW DISCORD WEBHOOK URL INSIDE THE QUOTES BELOW
+DISCORD_WEBHOOK_URL = "YOUR_NEW_DISCORD_WEBHOOK_URL"
 
 CITY_COORDS = {
     "NYC": {"name": "New York", "lat": 40.7128, "lon": -74.0060},
@@ -20,7 +22,6 @@ previous_forecasts = {}
 
 def send_discord_alert(message):
     try:
-        # Added User-Agent header to bypass Cloudflare data-center blocks on Discord
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         response = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, headers=headers, timeout=10)
         print(f"Discord response status: {response.status_code}, body: {response.text}", flush=True)
@@ -51,13 +52,11 @@ def get_hrrr_forecast_temp(lat, lon):
 
 def fetch_kalshi_events():
     try:
-        # Fetch all open events to prevent empty array drops caused by exact series filters
         url = f"{KALSHI_API_URL}/events?status=open"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             events = res.json().get("events", [])
-            # Filter locally for weather/high temperature series
             weather_events = [e for e in events if "HIGH" in e.get("series_ticker", "").upper() or "WEATHER" in e.get("title", "").upper()]
             print(f"Kalshi API returned {len(events)} total open events, {len(weather_events)} matched weather filters.", flush=True)
             return weather_events
