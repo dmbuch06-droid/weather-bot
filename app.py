@@ -20,7 +20,8 @@ previous_forecasts = {}
 
 def send_discord_alert(message):
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        print(f"Discord response status: {response.status_code}")
     except Exception as e:
         print(f"Discord webhook error: {e}")
 
@@ -48,10 +49,15 @@ def get_hrrr_forecast_temp(lat, lon):
 
 def fetch_kalshi_markets():
     try:
-        url = f"{KALSHI_API_URL}/markets?status=open"
+        # Filter explicitly by series root to capture all open future and current weather contracts
+        url = f"{KALSHI_API_URL}/markets?status=open&series_ticker=KXHIGH"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
-            return res.json().get("markets", [])
+            markets = res.json().get("markets", [])
+            print(f"Kalshi API successfully returned {len(markets)} weather markets.")
+            return markets
+        else:
+            print(f"Kalshi API returned status code {res.status_code}: {res.text}")
     except Exception as e:
         print(f"Kalshi API error: {e}")
     return []
@@ -64,11 +70,8 @@ def run_arbitrage_scan():
         print("No active markets returned from Kalshi.")
         return
 
-    weather_markets = [m for m in markets if any(series in m.get("ticker", "") for series in CITY_COORDS.keys())]
-    print(f"Found {len(weather_markets)} active weather contracts to analyze.")
-
-    for market in weather_markets:
-        ticker = market.get("ticker")
+    for market in markets:
+        ticker = market.get("ticker", "")
         title = market.get("title", "")
         event_ticker = market.get("event_ticker", ticker)
         yes_ask = market.get("yes_ask", 0)
@@ -131,7 +134,19 @@ def background_scanner():
 
 @app.route("/")
 def home():
-    return "HRRR Weather Arbitrage Bot with direct Kalshi links is active!"
+    return "HRRR Weather Arbitrage Bot is active and scanning future markets!"
+
+@app.route("/test-alert")
+def test_alert():
+    simulated_message = (
+        "🎯 **+EV PAPER TRADE SIGNAL (SIMULATION TEST)** 🎯\n"
+        "• Projected temperature in Chicago shifted from 84°F to 88°F. Bet of 88+ is a plus EV bet up to 61 cents.\n"
+        "• **Contract:** `KXHIGHCHI-26AUG28-T88` (Chicago High Temperature)\n"
+        "• **Execution Ask:** 54¢ | **Model Edge:** +14.0%\n"
+        "• **Trade on Kalshi:** https://kalshi.com/markets/kxhighchi"
+    )
+    send_discord_alert(simulated_message)
+    return "Simulated alert dispatched to Discord successfully!"
 
 if __name__ == "__main__":
     scanner_thread = threading.Thread(target=background_scanner, daemon=True)
