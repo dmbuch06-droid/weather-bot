@@ -10,17 +10,19 @@ KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1534781924252323891/7hm54rbQchA2idRvqEoi6j6grqqk7Wx48CBMWqbKwRJdn2vxkfZ9II1d1pCX1IXNbD2R"
 
 CITY_COORDS = {
-    "KXHIGHNYC": {"name": "New York", "lat": 40.7128, "lon": -74.0060},
-    "KXHIGHCHI": {"name": "Chicago", "lat": 41.8781, "lon": -87.6298},
-    "KXHIGHMIA": {"name": "Miami", "lat": 25.7617, "lon": -80.1918},
-    "KXHIGHAUS": {"name": "Austin", "lat": 30.2672, "lon": -97.7431},
+    "NYC": {"name": "New York", "lat": 40.7128, "lon": -74.0060},
+    "CHI": {"name": "Chicago", "lat": 41.8781, "lon": -87.6298},
+    "MIA": {"name": "Miami", "lat": 25.7617, "lon": -80.1918},
+    "AUS": {"name": "Austin", "lat": 30.2672, "lon": -97.7431},
 }
 
 previous_forecasts = {}
 
 def send_discord_alert(message):
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        # Added User-Agent header to bypass Cloudflare data-center blocks on Discord
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, headers=headers, timeout=10)
         print(f"Discord response status: {response.status_code}, body: {response.text}", flush=True)
     except Exception as e:
         print(f"Discord webhook error: {e}", flush=True)
@@ -49,12 +51,16 @@ def get_hrrr_forecast_temp(lat, lon):
 
 def fetch_kalshi_events():
     try:
-        url = f"{KALSHI_API_URL}/events?status=open&series_ticker=KXHIGH"
-        res = requests.get(url, timeout=10)
+        # Fetch all open events to prevent empty array drops caused by exact series filters
+        url = f"{KALSHI_API_URL}/events?status=open"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             events = res.json().get("events", [])
-            print(f"Kalshi API successfully returned {len(events)} weather event groups.", flush=True)
-            return events
+            # Filter locally for weather/high temperature series
+            weather_events = [e for e in events if "HIGH" in e.get("series_ticker", "").upper() or "WEATHER" in e.get("title", "").upper()]
+            print(f"Kalshi API returned {len(events)} total open events, {len(weather_events)} matched weather filters.", flush=True)
+            return weather_events
         else:
             print(f"Kalshi API returned status code {res.status_code}: {res.text}", flush=True)
     except Exception as e:
@@ -66,7 +72,7 @@ def run_arbitrage_scan():
     events = fetch_kalshi_events()
     
     if not events:
-        print("No active weather events returned from Kalshi.", flush=True)
+        print("No active weather events found.", flush=True)
         return
 
     total_markets_analyzed = 0
@@ -74,17 +80,17 @@ def run_arbitrage_scan():
     for event in events:
         markets = event.get("markets", [])
         for market in markets:
-            ticker = market.get("ticker", "")
+            ticker = market.get("ticker", "").upper()
             title = market.get("title", "")
             event_ticker = market.get("event_ticker", event.get("event_ticker", ticker))
             yes_ask = market.get("yes_ask", 0)
             
             matched_city = None
             prefix_key = None
-            for prefix in CITY_COORDS.keys():
-                if prefix in ticker:
-                    matched_city = CITY_COORDS[prefix]
-                    prefix_key = prefix
+            for code, data in CITY_COORDS.items():
+                if code in ticker:
+                    matched_city = data
+                    prefix_key = code
                     break
             
             if not matched_city or yes_ask <= 0:
