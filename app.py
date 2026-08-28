@@ -14,12 +14,12 @@ def background_scanner():
         except Exception as e:
             print(f"Error in background scanner: {e}")
         
-        # Wait 1 hour (3600 seconds) before scanning again
-        time.sleep(3600)
+        # Wait 5 minutes (300 seconds) before scanning again
+        time.sleep(300)
 
 @app.route("/")
 def home():
-    return "Weather bot is active and scanning in the background!"
+    return "Weather bot is active and scanning frequently in the background!"
 
 if __name__ == "__main__":
     # Start the background scanning loop in a separate thread so Flask can stay online
