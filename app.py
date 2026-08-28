@@ -3,7 +3,7 @@ import re
 import time
 import math
 import threading
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 
 import requests
 from flask import Flask, jsonify
@@ -11,27 +11,10 @@ from flask import Flask, jsonify
 
 # ============================================================
 # WEATHER + KALSHI RESEARCH BOT
+# DIAGNOSTIC VERSION
 #
 # PAPER TRADING / RESEARCH ONLY
-#
-# This bot:
-#
-# 1. Pulls Kalshi weather markets.
-# 2. Parses the weather date from market tickers.
-# 3. Pulls point forecasts.
-# 4. Pulls ensemble forecasts.
-# 5. Calculates preliminary probabilities from ensemble members.
-# 6. Compares those probabilities to Kalshi prices.
-# 7. Tracks forecast changes.
-# 8. Sends Discord alerts when:
-#
-#       Forecast changed significantly
-#       AND
-#       A positive preliminary edge exists
-#
-# No automatic trading is performed.
 # ============================================================
-
 
 app = Flask(__name__)
 
@@ -40,85 +23,53 @@ app = Flask(__name__)
 # CONFIGURATION
 # ============================================================
 
-KALSHI_API_URL = (
-    "https://external-api.kalshi.com/trade-api/v2"
-)
+KALSHI_API_URL = "https://external-api.kalshi.com/trade-api/v2"
 
-DISCORD_WEBHOOK_URL = os.environ.get(
-    "DISCORD_WEBHOOK_URL"
-)
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 REQUEST_TIMEOUT = 20
-
-# How often to scan.
 SCAN_INTERVAL_SECONDS = 300
 
-# Minimum forecast movement before an alert can trigger.
 TEMPERATURE_ALERT_CHANGE_F = 1.0
-
-# Minimum estimated edge required for a signal.
 MIN_EDGE_PERCENTAGE_POINTS = 5.0
-
-# Number of top signals shown in Discord.
 MAX_ALERTS_PER_CITY_DATE = 3
-
-# Prevent repeating the same alert too frequently.
 ALERT_COOLDOWN_SECONDS = 1800
-
-# How many days ahead to consider.
 MAX_FORECAST_DAYS_AHEAD = 7
 
 
 # ============================================================
 # WEATHER SERIES
-#
-# Add more cities here later.
 # ============================================================
 
 WEATHER_SERIES = {
-
     "KXHIGHNY": {
         "city": "New York",
-        "city_code": "NYC",
         "lat": 40.7128,
         "lon": -74.0060,
     },
-
     "KXHIGHCHI": {
         "city": "Chicago",
-        "city_code": "CHI",
         "lat": 41.8781,
         "lon": -87.6298,
     },
-
     "KXHIGHMIA": {
         "city": "Miami",
-        "city_code": "MIA",
         "lat": 25.7617,
         "lon": -80.1918,
     },
-
     "KXHIGHAUS": {
         "city": "Austin",
-        "city_code": "AUS",
         "lat": 30.2672,
         "lon": -97.7431,
     },
-
 }
 
 
 # ============================================================
 # MEMORY
-#
-# NOTE:
-# Render restarts clear this memory.
-#
-# Later we can replace this with persistent storage.
 # ============================================================
 
 forecast_history = {}
-
 alert_history = {}
 
 last_scan_results = {
@@ -153,50 +104,37 @@ def today_utc():
 # ============================================================
 
 def safe_float(value, default=None):
-
     try:
-
         if value is None:
             return default
 
         return float(value)
 
     except Exception:
-
         return default
 
 
 def average(values):
+    values = [v for v in values if v is not None]
 
-    valid_values = [
-        value
-        for value in values
-        if value is not None
-    ]
-
-    if not valid_values:
+    if not values:
         return None
 
-    return sum(valid_values) / len(valid_values)
+    return sum(values) / len(values)
 
 
 def standard_deviation(values):
+    values = [v for v in values if v is not None]
 
-    valid_values = [
-        value
-        for value in values
-        if value is not None
-    ]
-
-    if len(valid_values) < 2:
+    if len(values) < 2:
         return None
 
-    mean_value = average(valid_values)
+    mean_value = average(values)
 
     variance = sum(
         (value - mean_value) ** 2
-        for value in valid_values
-    ) / len(valid_values)
+        for value in values
+    ) / len(values)
 
     return math.sqrt(variance)
 
@@ -206,23 +144,14 @@ def standard_deviation(values):
 # ============================================================
 
 def send_discord_alert(message):
-
     if not DISCORD_WEBHOOK_URL:
-
-        print(
-            "DISCORD_WEBHOOK_URL is not configured.",
-            flush=True,
-        )
-
+        print("DISCORD_WEBHOOK_URL is not configured.", flush=True)
         return False
 
     try:
-
         response = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={
-                "content": message
-            },
+            json={"content": message},
             timeout=REQUEST_TIMEOUT,
         )
 
@@ -232,7 +161,6 @@ def send_discord_alert(message):
         )
 
         if response.status_code in (200, 204):
-
             return True
 
         print(
@@ -243,7 +171,6 @@ def send_discord_alert(message):
         return False
 
     except Exception as error:
-
         print(
             f"Discord exception: {error}",
             flush=True,
@@ -257,9 +184,7 @@ def send_discord_alert(message):
 # ============================================================
 
 def fetch_kalshi_markets(series_ticker):
-
     all_markets = []
-
     cursor = None
 
     while True:
@@ -274,7 +199,6 @@ def fetch_kalshi_markets(series_ticker):
             params["cursor"] = cursor
 
         try:
-
             response = requests.get(
                 f"{KALSHI_API_URL}/markets",
                 params=params,
@@ -288,20 +212,15 @@ def fetch_kalshi_markets(series_ticker):
             )
 
             if response.status_code != 200:
-
                 print(
-                    response.text[:500],
+                    response.text[:1000],
                     flush=True,
                 )
-
                 break
 
             data = response.json()
 
-            markets = data.get(
-                "markets",
-                [],
-            )
+            markets = data.get("markets", [])
 
             all_markets.extend(markets)
 
@@ -314,13 +233,10 @@ def fetch_kalshi_markets(series_ticker):
                 break
 
         except Exception as error:
-
             print(
-                f"Kalshi error for {series_ticker}: "
-                f"{error}",
+                f"Kalshi error for {series_ticker}: {error}",
                 flush=True,
             )
-
             break
 
     return all_markets
@@ -330,10 +246,7 @@ def fetch_kalshi_markets(series_ticker):
 # DATE PARSING
 #
 # Example:
-#
 # KXHIGHCHI-26AUG28-T87
-#
-# 26AUG28 = August 28, 2026
 # ============================================================
 
 def parse_date_from_ticker(ticker):
@@ -357,12 +270,6 @@ def parse_date_from_ticker(ticker):
     if not match:
         return None
 
-    year_short = match.group(1)
-
-    month_text = match.group(2)
-
-    day_text = match.group(3)
-
     months = {
         "JAN": 1,
         "FEB": 2,
@@ -378,79 +285,52 @@ def parse_date_from_ticker(ticker):
         "DEC": 12,
     }
 
-    month_number = months.get(month_text)
+    year = 2000 + int(match.group(1))
+    month = months.get(match.group(2))
+    day = int(match.group(3))
 
-    if not month_number:
+    if not month:
         return None
 
-    year_number = 2000 + int(year_short)
-
     try:
-
-        parsed_date = datetime(
-            year_number,
-            month_number,
-            int(day_text),
-        )
-
-        return parsed_date.strftime("%Y-%m-%d")
+        return datetime(
+            year,
+            month,
+            day,
+        ).strftime("%Y-%m-%d")
 
     except ValueError:
-
         return None
 
 
 def get_market_date(market):
-
-    ticker = market.get(
-        "ticker",
-        "",
+    return parse_date_from_ticker(
+        market.get("ticker", "")
     )
-
-    ticker_date = parse_date_from_ticker(
-        ticker
-    )
-
-    if ticker_date:
-        return ticker_date
-
-    return None
 
 
 # ============================================================
 # DATE FILTER
-#
-# Ignore markets for weather dates that have already passed.
 # ============================================================
 
-def is_relevant_forecast_date(
-    date_string
-):
+def is_relevant_forecast_date(date_string):
 
     try:
-
         market_date = datetime.strptime(
             date_string,
             "%Y-%m-%d",
         ).date()
 
-        current_date = today_utc()
-
         days_ahead = (
-            market_date
-            - current_date
+            market_date - today_utc()
         ).days
 
-        if days_ahead < 0:
-            return False
-
-        if days_ahead > MAX_FORECAST_DAYS_AHEAD:
-            return False
-
-        return True
+        return (
+            days_ahead >= 0
+            and days_ahead <= MAX_FORECAST_DAYS_AHEAD
+        )
 
     except Exception:
-
         return False
 
 
@@ -471,7 +351,6 @@ def get_yes_ask_cents(market):
         )
 
         if value is not None:
-
             return value * 100
 
 
@@ -481,9 +360,7 @@ def get_yes_ask_cents(market):
 
     if yes_ask is not None:
 
-        value = safe_float(
-            yes_ask
-        )
+        value = safe_float(yes_ask)
 
         if value is not None:
 
@@ -492,120 +369,104 @@ def get_yes_ask_cents(market):
 
             return value
 
-
     return None
 
 
 # ============================================================
-# MARKET STRIKE INFORMATION
+# RAW KALSHI DIAGNOSTICS
 # ============================================================
 
-def get_strike_info(market):
+def print_raw_market_data(market):
 
-    floor_value = safe_float(
-        market.get(
-            "floor_strike"
-        )
+    print(
+        "",
+        flush=True,
     )
 
-    cap_value = safe_float(
-        market.get(
-            "cap_strike"
-        )
+    print(
+        "RAW KALSHI MARKET DATA",
+        flush=True,
     )
 
-    return {
-
-        "ticker": market.get(
-            "ticker",
-            ""
-        ),
-
-        "strike_type": market.get(
-            "strike_type",
-            ""
-        ),
-
-        "floor": floor_value,
-
-        "cap": cap_value,
-
-    }
-
-
-# ============================================================
-# HUMAN READABLE CONTRACT DESCRIPTION
-# ============================================================
-
-def describe_contract(strike_info):
-
-    floor_value = strike_info.get(
-        "floor"
+    print(
+        f"Ticker: {market.get('ticker')}",
+        flush=True,
     )
 
-    cap_value = strike_info.get(
-        "cap"
+    print(
+        f"Title: {market.get('title')}",
+        flush=True,
     )
 
+    print(
+        f"Subtitle: {market.get('subtitle')}",
+        flush=True,
+    )
 
-    if (
-        floor_value is not None
-        and cap_value is not None
-    ):
+    print(
+        f"Yes subtitle: {market.get('yes_sub_title')}",
+        flush=True,
+    )
 
-        return (
-            f"{floor_value:g}°F to "
-            f"{cap_value:g}°F"
-        )
+    print(
+        f"No subtitle: {market.get('no_sub_title')}",
+        flush=True,
+    )
 
+    print(
+        f"Strike type: {market.get('strike_type')}",
+        flush=True,
+    )
 
-    if floor_value is not None:
+    print(
+        f"Floor strike: {market.get('floor_strike')}",
+        flush=True,
+    )
 
-        return (
-            f"{floor_value:g}°F or higher"
-        )
+    print(
+        f"Cap strike: {market.get('cap_strike')}",
+        flush=True,
+    )
 
+    print(
+        f"Yes ask: {market.get('yes_ask')}",
+        flush=True,
+    )
 
-    if cap_value is not None:
+    print(
+        f"Yes ask dollars: "
+        f"{market.get('yes_ask_dollars')}",
+        flush=True,
+    )
 
-        return (
-            f"{cap_value:g}°F or lower"
-        )
+    print(
+        f"Yes bid: {market.get('yes_bid')}",
+        flush=True,
+    )
 
-
-    return "Unknown strike"
+    print(
+        f"Last price: {market.get('last_price')}",
+        flush=True,
+    )
 
 
 # ============================================================
-# POINT FORECAST
-#
-# Returns daily:
-#
-# temperature_2m_max
-# precipitation_sum
+# WEATHER POINT FORECAST
 # ============================================================
 
 def fetch_point_forecast(lat, lon):
 
     params = {
-
         "latitude": lat,
-
         "longitude": lon,
-
         "daily": (
             "temperature_2m_max,"
             "precipitation_sum"
         ),
-
         "temperature_unit": "fahrenheit",
-
         "precipitation_unit": "inch",
-
         "timezone": "auto",
-
         "forecast_days": MAX_FORECAST_DAYS_AHEAD,
-
     }
 
     try:
@@ -625,7 +486,7 @@ def fetch_point_forecast(lat, lon):
         if response.status_code != 200:
 
             print(
-                response.text[:500],
+                response.text[:1000],
                 flush=True,
             )
 
@@ -634,15 +495,9 @@ def fetch_point_forecast(lat, lon):
 
         data = response.json()
 
-        daily = data.get(
-            "daily",
-            {},
-        )
+        daily = data.get("daily", {})
 
-        dates = daily.get(
-            "time",
-            [],
-        )
+        dates = daily.get("time", [])
 
         highs = daily.get(
             "temperature_2m_max",
@@ -660,29 +515,22 @@ def fetch_point_forecast(lat, lon):
 
         for index, date_value in enumerate(dates):
 
-            high_value = None
+            high_value = (
+                highs[index]
+                if index < len(highs)
+                else None
+            )
 
-            precipitation_value = None
-
-
-            if index < len(highs):
-
-                high_value = highs[index]
-
-
-            if index < len(precipitation):
-
-                precipitation_value = (
-                    precipitation[index]
-                )
+            precipitation_value = (
+                precipitation[index]
+                if index < len(precipitation)
+                else None
+            )
 
 
             forecasts[date_value] = {
-
                 "high_temperature": high_value,
-
                 "precipitation": precipitation_value,
-
             }
 
 
@@ -692,8 +540,7 @@ def fetch_point_forecast(lat, lon):
     except Exception as error:
 
         print(
-            f"Point forecast error: "
-            f"{error}",
+            f"Point forecast error: {error}",
             flush=True,
         )
 
@@ -701,25 +548,18 @@ def fetch_point_forecast(lat, lon):
 
 
 # ============================================================
-# ENSEMBLE FORECAST
+# ENSEMBLE API
 # ============================================================
 
 def fetch_ensemble_data(lat, lon):
 
     params = {
-
         "latitude": lat,
-
         "longitude": lon,
-
         "hourly": "temperature_2m",
-
         "temperature_unit": "fahrenheit",
-
         "timezone": "auto",
-
         "forecast_days": MAX_FORECAST_DAYS_AHEAD,
-
     }
 
 
@@ -731,18 +571,16 @@ def fetch_ensemble_data(lat, lon):
             timeout=REQUEST_TIMEOUT,
         )
 
-
         print(
             f"Ensemble API status: "
             f"{response.status_code}",
             flush=True,
         )
 
-
         if response.status_code != 200:
 
             print(
-                response.text[:500],
+                response.text[:1000],
                 flush=True,
             )
 
@@ -755,7 +593,7 @@ def fetch_ensemble_data(lat, lon):
     except Exception as error:
 
         print(
-            f"Ensemble error: {error}",
+            f"Ensemble API error: {error}",
             flush=True,
         )
 
@@ -764,11 +602,6 @@ def fetch_ensemble_data(lat, lon):
 
 # ============================================================
 # BUILD DAILY ENSEMBLE HIGHS
-#
-# Finds all temperature ensemble members.
-#
-# Calculates the maximum hourly temperature
-# for each member on each day.
 # ============================================================
 
 def build_daily_ensemble_highs(
@@ -801,13 +634,24 @@ def build_daily_ensemble_highs(
     for key in hourly.keys():
 
         if (
-            key.startswith(
-                "temperature_2m"
-            )
+            key.startswith("temperature_2m")
             and key != "time"
         ):
-
             member_keys.append(key)
+
+
+    print(
+        f"Ensemble temperature keys found: "
+        f"{len(member_keys)}",
+        flush=True,
+    )
+
+
+    print(
+        f"First ensemble keys: "
+        f"{member_keys[:10]}",
+        flush=True,
+    )
 
 
     daily_members = {}
@@ -843,13 +687,12 @@ def build_daily_ensemble_highs(
                 date_value
                 not in daily_members
             ):
-
                 daily_members[
                     date_value
                 ] = {}
 
 
-            existing_value = (
+            current_max = (
                 daily_members[
                     date_value
                 ].get(member_key)
@@ -857,8 +700,8 @@ def build_daily_ensemble_highs(
 
 
             if (
-                existing_value is None
-                or temperature > existing_value
+                current_max is None
+                or temperature > current_max
             ):
 
                 daily_members[
@@ -873,23 +716,127 @@ def build_daily_ensemble_highs(
         daily_members.items()
     ):
 
-        values = list(
+        result[date_value] = list(
             members.values()
         )
-
-
-        if values:
-
-            result[
-                date_value
-            ] = values
 
 
     return result
 
 
 # ============================================================
-# FORECAST CHANGE TRACKING
+# ENSEMBLE DIAGNOSTICS
+# ============================================================
+
+def print_ensemble_distribution(
+    member_highs
+):
+
+    if not member_highs:
+
+        print(
+            "NO ENSEMBLE MEMBERS AVAILABLE",
+            flush=True,
+        )
+
+        return
+
+
+    values = sorted(
+        [
+            value
+            for value in member_highs
+            if value is not None
+        ]
+    )
+
+
+    if not values:
+
+        print(
+            "NO VALID ENSEMBLE VALUES",
+            flush=True,
+        )
+
+        return
+
+
+    mean_value = average(values)
+
+    std_value = standard_deviation(values)
+
+
+    print(
+        "",
+        flush=True,
+    )
+
+    print(
+        "ENSEMBLE HIGH DISTRIBUTION",
+        flush=True,
+    )
+
+    print(
+        f"Members: {len(values)}",
+        flush=True,
+    )
+
+    print(
+        f"Minimum: {min(values):.2f}°F",
+        flush=True,
+    )
+
+    print(
+        f"Maximum: {max(values):.2f}°F",
+        flush=True,
+    )
+
+    print(
+        f"Mean: {mean_value:.2f}°F",
+        flush=True,
+    )
+
+
+    if std_value is not None:
+
+        print(
+            f"Standard deviation: "
+            f"{std_value:.2f}°F",
+            flush=True,
+        )
+
+
+    print(
+        "Sorted member highs:",
+        flush=True,
+    )
+
+
+    formatted_values = [
+        f"{value:.1f}"
+        for value in values
+    ]
+
+
+    for start in range(
+        0,
+        len(formatted_values),
+        10,
+    ):
+
+        chunk = formatted_values[
+            start:start + 10
+        ]
+
+
+        print(
+            "  " + ", ".join(chunk),
+            flush=True,
+        )
+
+
+# ============================================================
+# FORECAST CHANGE
 # ============================================================
 
 def detect_forecast_change(
@@ -918,17 +865,11 @@ def detect_forecast_change(
     if old_value is None:
 
         return {
-
             "first_observation": True,
-
             "changed": False,
-
             "old": None,
-
             "new": forecast_value,
-
             "delta": 0.0,
-
         }
 
 
@@ -939,39 +880,58 @@ def detect_forecast_change(
 
 
     return {
-
         "first_observation": False,
-
         "changed": (
-            forecast_value
-            != old_value
+            forecast_value != old_value
+        ),
+        "old": old_value,
+        "new": forecast_value,
+        "delta": delta,
+    }
+
+
+# ============================================================
+# TEMPORARY STRIKE INTERPRETATION
+#
+# This is intentionally conservative.
+#
+# We will verify this against the raw Kalshi
+# fields printed in the logs.
+# ============================================================
+
+def get_strike_info(market):
+
+    return {
+
+        "ticker": market.get(
+            "ticker",
+            "",
         ),
 
-        "old": old_value,
+        "strike_type": market.get(
+            "strike_type",
+            "",
+        ),
 
-        "new": forecast_value,
+        "floor": safe_float(
+            market.get(
+                "floor_strike"
+            )
+        ),
 
-        "delta": delta,
+        "cap": safe_float(
+            market.get(
+                "cap_strike"
+            )
+        ),
 
     }
 
 
 # ============================================================
-# PRELIMINARY PROBABILITY MODEL
+# PROBABILITY MODEL
 #
-# Uses raw ensemble-member frequency.
-#
-# Example:
-#
-# 20 of 31 members >= 85
-#
-# Probability estimate:
-#
-# 20 / 31 = 64.5%
-#
-# IMPORTANT:
-#
-# This is NOT YET CALIBRATED.
+# DIAGNOSTIC ONLY
 # ============================================================
 
 def estimate_probability_from_ensemble(
@@ -980,13 +940,9 @@ def estimate_probability_from_ensemble(
 ):
 
     valid_members = [
-
         value
-
         for value in member_highs
-
         if value is not None
-
     ]
 
 
@@ -1006,7 +962,6 @@ def estimate_probability_from_ensemble(
     favorable = 0
 
 
-    # Range contract
     if (
         floor_value is not None
         and cap_value is not None
@@ -1018,43 +973,76 @@ def estimate_probability_from_ensemble(
                 value >= floor_value
                 and value < cap_value
             ):
-
                 favorable += 1
 
 
-    # "X or higher"
     elif floor_value is not None:
 
         for value in valid_members:
 
             if value >= floor_value:
-
                 favorable += 1
 
 
-    # "X or lower"
     elif cap_value is not None:
 
         for value in valid_members:
 
             if value <= cap_value:
-
                 favorable += 1
 
 
     else:
-
         return None
 
 
-    return (
-        favorable
-        / len(valid_members)
-    )
+    return favorable / len(valid_members)
 
 
 # ============================================================
-# MARKET ANALYSIS
+# CONTRACT DESCRIPTION
+# ============================================================
+
+def describe_contract(strike_info):
+
+    floor_value = strike_info.get(
+        "floor"
+    )
+
+    cap_value = strike_info.get(
+        "cap"
+    )
+
+
+    if (
+        floor_value is not None
+        and cap_value is not None
+    ):
+        return (
+            f"{floor_value:g}°F "
+            f"to {cap_value:g}°F"
+        )
+
+
+    if floor_value is not None:
+        return (
+            f"{floor_value:g}°F "
+            f"or higher"
+        )
+
+
+    if cap_value is not None:
+        return (
+            f"{cap_value:g}°F "
+            f"or lower"
+        )
+
+
+    return "Unknown strike"
+
+
+# ============================================================
+# ANALYZE MARKET
 # ============================================================
 
 def analyze_market(
@@ -1062,10 +1050,8 @@ def analyze_market(
     member_highs,
 ):
 
-    yes_ask_cents = (
-        get_yes_ask_cents(
-            market
-        )
+    yes_ask_cents = get_yes_ask_cents(
+        market
     )
 
 
@@ -1073,12 +1059,10 @@ def analyze_market(
         return None
 
 
-    # Ignore invalid prices.
     if (
         yes_ask_cents <= 0
         or yes_ask_cents >= 100
     ):
-
         return None
 
 
@@ -1100,8 +1084,7 @@ def analyze_market(
 
 
     market_probability = (
-        yes_ask_cents
-        / 100.0
+        yes_ask_cents / 100.0
     )
 
 
@@ -1117,356 +1100,57 @@ def analyze_market(
 
         "probability": probability,
 
-        "market_probability": (
-            market_probability
-        ),
+        "yes_ask_cents": yes_ask_cents,
 
-        "edge": edge,
+        "edge_points": edge * 100,
 
-        "edge_points": (
-            edge * 100
-        ),
-
-        "yes_ask_cents": (
-            yes_ask_cents
-        ),
-
-        "strike_info": (
-            strike_info
-        ),
+        "strike_info": strike_info,
 
     }
 
 
 # ============================================================
-# ALERT COOLDOWN
+# PRINT ANALYSIS
 # ============================================================
 
-def can_send_alert(alert_key):
-
-    now = time.time()
-
-
-    previous_time = (
-        alert_history.get(
-            alert_key
-        )
-    )
-
-
-    if previous_time is None:
-
-        alert_history[
-            alert_key
-        ] = now
-
-        return True
-
-
-    elapsed = (
-        now
-        - previous_time
-    )
-
-
-    if (
-        elapsed
-        >= ALERT_COOLDOWN_SECONDS
-    ):
-
-        alert_history[
-            alert_key
-        ] = now
-
-        return True
-
-
-    return False
-
-
-# ============================================================
-# KALSHI LINK
-# ============================================================
-
-def get_kalshi_url(market):
-
-    event_ticker = market.get(
-        "event_ticker",
-        "",
-    )
-
-
-    if event_ticker:
-
-        return (
-            "https://kalshi.com/markets/"
-            f"{event_ticker.lower()}"
-        )
-
-
-    return "https://kalshi.com"
-
-
-# ============================================================
-# DISCORD MESSAGE
-# ============================================================
-
-def build_discord_message(
-    config,
-    forecast_date,
-    forecast_value,
-    change,
-    ensemble_members,
-    signals,
+def print_market_analysis(
+    analysis
 ):
 
-    city = config["city"]
+    market = analysis["market"]
 
-
-    ensemble_mean = average(
-        ensemble_members
-    )
-
-
-    ensemble_std = standard_deviation(
-        ensemble_members
-    )
-
-
-    lines = [
-
-        "🌦️ **FORECAST CHANGE DETECTED**",
-
-        "",
-
-        f"📍 **{city}**",
-
-        f"📅 Weather date: "
-        f"{forecast_date}",
-
-        "",
-
-    ]
-
-
-    if change["old"] is not None:
-
-        lines.extend([
-
-            "🔄 **Forecast high changed:**",
-
-            (
-                f"{change['old']:.1f}°F"
-                f" → "
-                f"{forecast_value:.1f}°F"
-            ),
-
-            (
-                f"Change: "
-                f"{change['delta']:+.1f}°F"
-            ),
-
-        ])
-
-    else:
-
-        lines.extend([
-
-            "🔄 **Current forecast high:**",
-
-            f"{forecast_value:.1f}°F",
-
-        ])
-
-
-    lines.extend([
-
-        "",
-
-        "📊 **Ensemble distribution:**",
-
-        f"Members: "
-        f"{len(ensemble_members)}",
-
-    ])
-
-
-    if ensemble_mean is not None:
-
-        lines.append(
-
-            f"Mean high: "
-            f"{ensemble_mean:.1f}°F"
-
-        )
-
-
-    if ensemble_std is not None:
-
-        lines.append(
-
-            f"Spread: "
-            f"±{ensemble_std:.1f}°F"
-
-        )
-
-
-    lines.extend([
-
-        "",
-
-        "🎯 **Top preliminary paper signals:**",
-
-    ])
-
-
-    for index, signal in enumerate(
-        signals,
-        start=1,
-    ):
-
-        market = signal["market"]
-
-        strike_info = signal[
-            "strike_info"
-        ]
-
-
-        contract_description = (
-            describe_contract(
-                strike_info
-            )
-        )
-
-
-        lines.extend([
-
-            "",
-
-            (
-                f"**{index}. "
-                f"{contract_description}**"
-            ),
-
-            (
-                f"Contract: "
-                f"`{market.get('ticker', 'Unknown')}`"
-            ),
-
-            (
-                f"Estimated probability: "
-                f"{signal['probability'] * 100:.1f}%"
-            ),
-
-            (
-                f"Kalshi YES ask: "
-                f"{signal['yes_ask_cents']:.1f}¢"
-            ),
-
-            (
-                f"Preliminary edge: "
-                f"{signal['edge_points']:+.1f} points"
-            ),
-
-            get_kalshi_url(market),
-
-        ])
-
-
-    lines.extend([
-
-        "",
-
-        "⚠️ **PAPER / RESEARCH ONLY**",
-
-        (
-            "Probability currently uses "
-            "raw ensemble-member frequency "
-            "and is not historically calibrated."
-        ),
-
-    ])
-
-
-    message = "\n".join(lines)
-
-
-    return message[:1900]
-
-
-# ============================================================
-# PRINT TOP OPPORTUNITIES
-#
-# This runs EVERY scan.
-#
-# Discord does NOT fire every scan.
-# ============================================================
-
-def print_top_opportunities(
-    city,
-    forecast_date,
-    analyses,
-):
-
-    if not analyses:
-
-        print(
-            "No analyzable markets.",
-            flush=True,
-        )
-
-        return
-
-
-    analyses.sort(
-        key=lambda item:
-        item["edge"],
-        reverse=True,
+    description = describe_contract(
+        analysis["strike_info"]
     )
 
 
     print(
-        "",
+        f"Contract: {market.get('ticker')}",
         flush=True,
     )
 
     print(
-        f"TOP OPPORTUNITIES: "
-        f"{city} | {forecast_date}",
+        f"Interpretation: {description}",
         flush=True,
     )
 
+    print(
+        f"Model probability: "
+        f"{analysis['probability'] * 100:.1f}%",
+        flush=True,
+    )
 
-    top_results = analyses[:5]
+    print(
+        f"YES ask: "
+        f"{analysis['yes_ask_cents']:.1f}¢",
+        flush=True,
+    )
 
-
-    for index, analysis in enumerate(
-        top_results,
-        start=1,
-    ):
-
-        market = analysis["market"]
-
-        description = describe_contract(
-            analysis["strike_info"]
-        )
-
-
-        print(
-
-            f"{index}. "
-            f"{description} | "
-            f"Model: "
-            f"{analysis['probability'] * 100:.1f}% | "
-            f"Ask: "
-            f"{analysis['yes_ask_cents']:.1f}¢ | "
-            f"Edge: "
-            f"{analysis['edge_points']:+.1f} points | "
-            f"{market.get('ticker')}",
-
-            flush=True,
-
-        )
+    print(
+        f"Edge: "
+        f"{analysis['edge_points']:+.1f} points",
+        flush=True,
+    )
 
 
 # ============================================================
@@ -1485,7 +1169,7 @@ def run_scan():
     )
 
     print(
-        "STARTING WEATHER MARKET SCAN",
+        "STARTING WEATHER MARKET DIAGNOSTIC SCAN",
         flush=True,
     )
 
@@ -1496,36 +1180,21 @@ def run_scan():
 
 
     results = {
-
         "timestamp": utc_timestamp(),
-
         "series_checked": 0,
-
         "markets_checked": 0,
-
         "forecast_changes": 0,
-
         "signals_found": 0,
-
         "alerts_sent": 0,
-
         "errors": [],
-
     }
 
-
-    # ========================================================
-    # EACH CITY
-    # ========================================================
 
     for series_ticker, config in (
         WEATHER_SERIES.items()
     ):
 
-
-        results[
-            "series_checked"
-        ] += 1
+        results["series_checked"] += 1
 
 
         print(
@@ -1545,9 +1214,9 @@ def run_scan():
         )
 
 
-        # ====================================================
+        # ----------------------------------------------------
         # POINT FORECAST
-        # ====================================================
+        # ----------------------------------------------------
 
         point_forecasts = (
             fetch_point_forecast(
@@ -1559,26 +1228,17 @@ def run_scan():
 
         if not point_forecasts:
 
-            error = (
-                f"No point forecast "
-                f"for {config['city']}"
+            results["errors"].append(
+                f"No point forecast for "
+                f"{config['city']}"
             )
-
-            print(
-                error,
-                flush=True,
-            )
-
-            results[
-                "errors"
-            ].append(error)
 
             continue
 
 
-        # ====================================================
+        # ----------------------------------------------------
         # ENSEMBLE
-        # ====================================================
+        # ----------------------------------------------------
 
         ensemble_data = (
             fetch_ensemble_data(
@@ -1602,36 +1262,27 @@ def run_scan():
         )
 
 
-        # ====================================================
-        # KALSHI MARKETS
-        # ====================================================
+        # ----------------------------------------------------
+        # KALSHI
+        # ----------------------------------------------------
 
-        markets = (
-            fetch_kalshi_markets(
-                series_ticker
-            )
+        markets = fetch_kalshi_markets(
+            series_ticker
         )
 
 
         print(
-            f"Markets found: "
-            f"{len(markets)}",
+            f"Markets found: {len(markets)}",
             flush=True,
         )
 
-
-        # ====================================================
-        # GROUP MARKETS BY WEATHER DATE
-        # ====================================================
 
         markets_by_date = {}
 
 
         for market in markets:
 
-            results[
-                "markets_checked"
-            ] += 1
+            results["markets_checked"] += 1
 
 
             market_date = get_market_date(
@@ -1664,29 +1315,19 @@ def run_scan():
                 continue
 
 
-            if (
-                market_date
-                not in markets_by_date
-            ):
-
-                markets_by_date[
-                    market_date
-                ] = []
+            markets_by_date.setdefault(
+                market_date,
+                [],
+            ).append(market)
 
 
-            markets_by_date[
-                market_date
-            ].append(market)
-
-
-        # ====================================================
-        # PROCESS EACH DATE ONCE
-        # ====================================================
+        # ----------------------------------------------------
+        # PROCESS EACH DATE
+        # ----------------------------------------------------
 
         for market_date, date_markets in (
             markets_by_date.items()
         ):
-
 
             print(
                 "\n"
@@ -1710,7 +1351,7 @@ def run_scan():
             if not point_forecast:
 
                 print(
-                    "No point forecast for this date.",
+                    "No point forecast for date.",
                     flush=True,
                 )
 
@@ -1744,14 +1385,14 @@ def run_scan():
             member_highs = (
                 daily_ensemble_highs.get(
                     market_date,
-                    []
+                    [],
                 )
             )
 
 
             print(
-                f"Point forecast high: "
-                f"{forecast_high:.1f}°F",
+                f"POINT FORECAST HIGH: "
+                f"{forecast_high:.2f}°F",
                 flush=True,
             )
 
@@ -1759,76 +1400,96 @@ def run_scan():
             if precipitation is not None:
 
                 print(
-                    f"Forecast precipitation: "
-                    f"{precipitation:.2f} in",
+                    f"POINT FORECAST PRECIPITATION: "
+                    f"{precipitation:.2f} inches",
                     flush=True,
                 )
 
 
-            print(
-                f"Ensemble members: "
-                f"{len(member_highs)}",
-                flush=True,
+            # ------------------------------------------------
+            # PRINT ENSEMBLE DIAGNOSTICS
+            # ------------------------------------------------
+
+            print_ensemble_distribution(
+                member_highs
             )
 
 
-            # =================================================
-            # FORECAST CHANGE
-            # =================================================
+            # ------------------------------------------------
+            # FORECAST HISTORY
+            # ------------------------------------------------
 
-            change = (
-                detect_forecast_change(
-                    series_ticker,
-                    market_date,
-                    forecast_high,
-                )
+            change = detect_forecast_change(
+                series_ticker,
+                market_date,
+                forecast_high,
             )
 
 
             if change["first_observation"]:
 
                 print(
-                    "Forecast status: "
+                    "FORECAST STATUS: "
                     "FIRST OBSERVATION",
-                    flush=True,
-                )
-
-                print(
-                    "Baseline stored.",
                     flush=True,
                 )
 
             else:
 
                 print(
-                    f"Previous forecast: "
-                    f"{change['old']:.1f}°F",
+                    f"PREVIOUS FORECAST: "
+                    f"{change['old']:.2f}°F",
                     flush=True,
                 )
 
                 print(
-                    f"Forecast change: "
-                    f"{change['delta']:+.1f}°F",
+                    f"FORECAST CHANGE: "
+                    f"{change['delta']:+.2f}°F",
                     flush=True,
                 )
 
 
-            # =================================================
-            # ANALYZE ALL MARKETS
+            # ------------------------------------------------
+            # RAW KALSHI DATA
             #
-            # This happens EVERY scan.
-            # =================================================
+            # Print every market so we can verify
+            # strike interpretation.
+            # ------------------------------------------------
+
+            print(
+                "",
+                flush=True,
+            )
+
+            print(
+                "==================================================",
+                flush=True,
+            )
+
+            print(
+                "RAW KALSHI CONTRACT INSPECTION",
+                flush=True,
+            )
+
+            print(
+                "==================================================",
+                flush=True,
+            )
+
 
             analyses = []
 
 
             for market in date_markets:
 
-                analysis = (
-                    analyze_market(
-                        market,
-                        member_highs,
-                    )
+                print_raw_market_data(
+                    market
+                )
+
+
+                analysis = analyze_market(
+                    market,
+                    member_highs,
                 )
 
 
@@ -1839,26 +1500,73 @@ def run_scan():
                     )
 
 
-            # =================================================
-            # LOG BEST OPPORTUNITIES EVERY SCAN
-            # =================================================
+                    print(
+                        "CURRENT DIAGNOSTIC MODEL:",
+                        flush=True,
+                    )
 
-            print_top_opportunities(
 
-                config["city"],
+                    print_market_analysis(
+                        analysis
+                    )
 
-                market_date,
 
-                analyses,
+            # ------------------------------------------------
+            # TOP RESULTS
+            # ------------------------------------------------
 
+            analyses.sort(
+                key=lambda item:
+                item["edge_points"],
+                reverse=True,
             )
 
 
-            # =================================================
-            # FILTER POSITIVE SIGNALS
-            # =================================================
+            print(
+                "",
+                flush=True,
+            )
 
-            signals = [
+            print(
+                "==================================================",
+                flush=True,
+            )
+
+            print(
+                "TOP DIAGNOSTIC RESULTS",
+                flush=True,
+            )
+
+            print(
+                "==================================================",
+                flush=True,
+            )
+
+
+            for analysis in analyses[:5]:
+
+                description = describe_contract(
+                    analysis["strike_info"]
+                )
+
+
+                print(
+
+                    f"{description} | "
+                    f"Model: "
+                    f"{analysis['probability'] * 100:.1f}% | "
+                    f"Ask: "
+                    f"{analysis['yes_ask_cents']:.1f}¢ | "
+                    f"Edge: "
+                    f"{analysis['edge_points']:+.1f} points | "
+                    f"{analysis['market'].get('ticker')}",
+
+                    flush=True,
+
+                )
+
+
+            positive_signals = [
 
                 analysis
 
@@ -1872,171 +1580,12 @@ def run_scan():
             ]
 
 
-            if signals:
-
-                results[
-                    "signals_found"
-                ] += len(signals)
-
-
-            # =================================================
-            # DISCORD ALERT CONDITIONS
-            #
-            # 1. Not first observation
-            # 2. Forecast actually changed
-            # 3. Change >= threshold
-            # 4. Positive edge exists
-            # =================================================
-
-            if change["first_observation"]:
-
-                print(
-                    "No Discord alert: "
-                    "first observation.",
-                    flush=True,
-                )
-
-                continue
-
-
-            if not change["changed"]:
-
-                print(
-                    "No Discord alert: "
-                    "forecast unchanged.",
-                    flush=True,
-                )
-
-                continue
-
-
-            if (
-                abs(change["delta"])
-                < TEMPERATURE_ALERT_CHANGE_F
-            ):
-
-                print(
-                    "No Discord alert: "
-                    "forecast change below threshold.",
-                    flush=True,
-                )
-
-                continue
-
-
             results[
-                "forecast_changes"
-            ] += 1
-
-
-            if not signals:
-
-                print(
-                    "No Discord alert: "
-                    "no positive preliminary signal.",
-                    flush=True,
-                )
-
-                continue
-
-
-            # Sort best edge first.
-            signals.sort(
-                key=lambda item:
-                item["edge"],
-                reverse=True,
+                "signals_found"
+            ] += len(
+                positive_signals
             )
 
-
-            top_signals = signals[
-                :MAX_ALERTS_PER_CITY_DATE
-            ]
-
-
-            # =================================================
-            # ALERT KEY
-            #
-            # Includes the new forecast so a new movement
-            # can create a new alert.
-            # =================================================
-
-            alert_key = (
-
-                f"{series_ticker}|"
-
-                f"{market_date}|"
-
-                f"{forecast_high:.1f}"
-
-            )
-
-
-            if not can_send_alert(
-                alert_key
-            ):
-
-                print(
-                    "Discord alert cooldown active.",
-                    flush=True,
-                )
-
-                continue
-
-
-            # =================================================
-            # BUILD MESSAGE
-            # =================================================
-
-            message = build_discord_message(
-
-                config,
-
-                market_date,
-
-                forecast_high,
-
-                change,
-
-                member_highs,
-
-                top_signals,
-
-            )
-
-
-            print(
-                "",
-                flush=True,
-            )
-
-            print(
-                "DISCORD ALERT:",
-                flush=True,
-            )
-
-            print(
-                message,
-                flush=True,
-            )
-
-
-            success = (
-                send_discord_alert(
-                    message
-                )
-            )
-
-
-            if success:
-
-                results[
-                    "alerts_sent"
-                ] += 1
-
-
-    # ========================================================
-    # SAVE RESULTS
-    # ========================================================
 
     last_scan_results = results
 
@@ -2048,7 +1597,7 @@ def run_scan():
     )
 
     print(
-        "SCAN COMPLETE",
+        "DIAGNOSTIC SCAN COMPLETE",
         flush=True,
     )
 
@@ -2065,20 +1614,8 @@ def run_scan():
     )
 
     print(
-        f"Forecast changes: "
-        f"{results['forecast_changes']}",
-        flush=True,
-    )
-
-    print(
-        f"Positive preliminary signals: "
+        f"Diagnostic positive signals: "
         f"{results['signals_found']}",
-        flush=True,
-    )
-
-    print(
-        f"Discord alerts sent: "
-        f"{results['alerts_sent']}",
         flush=True,
     )
 
@@ -2134,16 +1671,9 @@ def background_scanner():
 def home():
 
     return jsonify({
-
         "status": "running",
-
-        "name": (
-            "Weather Kalshi "
-            "Research Bot"
-        ),
-
+        "mode": "diagnostic",
         "paper_trading": True,
-
     })
 
 
@@ -2151,23 +1681,11 @@ def home():
 def health():
 
     return jsonify({
-
         "status": "ok",
-
         "discord_configured": bool(
             DISCORD_WEBHOOK_URL
         ),
-
-        "scan_interval_seconds": (
-            SCAN_INTERVAL_SECONDS
-        ),
-
-        "series": list(
-            WEATHER_SERIES.keys()
-        ),
-
         "utc_time": utc_timestamp(),
-
     })
 
 
@@ -2182,21 +1700,14 @@ def status():
 @app.route("/test-alert")
 def test_alert():
 
-    message = (
+    success = send_discord_alert(
         "🧪 **WEATHER BOT TEST**\n\n"
         "Discord connection is working."
     )
 
 
-    success = send_discord_alert(
-        message
-    )
-
-
     return jsonify({
-
         "success": success
-
     })
 
 
@@ -2208,40 +1719,28 @@ def manual_scan():
         run_scan()
 
         return jsonify({
-
             "success": True,
-
-            "results": (
-                last_scan_results
-            ),
-
+            "results": last_scan_results,
         })
 
     except Exception as error:
 
         return jsonify({
-
             "success": False,
-
             "error": str(error),
-
         }), 500
 
 
 # ============================================================
-# APPLICATION START
+# START APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
 
     scanner_thread = threading.Thread(
-
         target=background_scanner,
-
         daemon=True,
-
     )
-
 
     scanner_thread.start()
 
@@ -2261,9 +1760,6 @@ if __name__ == "__main__":
 
 
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
     )
