@@ -224,7 +224,7 @@ def background_scanner():
   except Exception as e:print(f'Background scanner error: {e}',flush=True); bot_status['last_error']=str(e)
   print(f'Waiting {SCAN_INTERVAL_SECONDS} seconds...',flush=True); time.sleep(SCAN_INTERVAL_SECONDS)
 @app.route('/')
-def home():return 'Weather + Kalshi paper-trading monitor is running. Use /health, /status, /paper-trades, or /test-alert.'
+def home():return 'Weather + Kalshi paper-trading monitor is running. Use /health, /status, /paper-trades, /network-test, or /test-alert.'
 @app.route('/health')
 def health():
  ok,err=validate_discord_webhook_url(DISCORD_WEBHOOK_URL); return jsonify({'status':'ok','bot':bot_status,'discord_configured':bool(DISCORD_WEBHOOK_URL),'discord_webhook_url_valid':ok,'discord_webhook_validation_error':err,'cities':list(CITIES),'state_file':STATE_FILE,'state_version':STATE_VERSION,'cache_entries':len(persistent_state.get('cache',{})),'forecast_entries':len(persistent_state.get('forecasts',{})),'paper_trade_count':len(persistent_state.get('paper_trades',[]))})
@@ -234,6 +234,71 @@ def status():return jsonify(bot_status)
 def paper_trades():return jsonify(persistent_state.get('paper_trades',[])[-100:])
 @app.route('/debug-state')
 def debug_state():return jsonify({'cache':persistent_state.get('cache',{}),'forecasts':persistent_state.get('forecasts',{}),'alerts':persistent_state.get('alerts',{})})
+@app.route('/network-test')
+def network_test():
+    # Diagnostic endpoint: reports the public IP used by Render and
+    # tests whether Discord's webhook endpoint is reachable. It never
+    # returns the webhook URL or webhook token.
+    result = {
+        'public_ip': None,
+        'ip_lookup_status': None,
+        'discord_webhook_url_valid': False,
+        'discord_get_status': None,
+        'discord_get_content_type': None,
+        'discord_cloudflare_block': False,
+        'error': None,
+    }
+
+    ok, err = validate_discord_webhook_url(DISCORD_WEBHOOK_URL)
+    result['discord_webhook_url_valid'] = ok
+    if not ok:
+        result['error'] = err
+        return jsonify(result), 500
+
+    try:
+        ip_response = requests.get(
+            'https://api.ipify.org?format=json',
+            headers={
+                'User-Agent': 'WeatherKalshiPaperMonitor/1.0',
+                'Accept': 'application/json',
+            },
+            timeout=10,
+        )
+        result['ip_lookup_status'] = ip_response.status_code
+        if ip_response.status_code == 200:
+            try:
+                result['public_ip'] = ip_response.json().get('ip')
+            except Exception:
+                result['public_ip'] = ip_response.text.strip()[:100]
+    except Exception as error:
+        result['error'] = f'Public IP lookup failed: {error}'
+
+    try:
+        discord_response = requests.get(
+            DISCORD_WEBHOOK_URL,
+            headers={
+                'User-Agent': 'WeatherKalshiPaperMonitor/1.0',
+                'Accept': 'application/json',
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        result['discord_get_status'] = discord_response.status_code
+        result['discord_get_content_type'] = discord_response.headers.get('content-type')
+
+        body = discord_response.text[:1000].lower()
+        result['discord_cloudflare_block'] = (
+            'access denied' in body
+            or 'cloudflare' in body
+        )
+
+    except Exception as error:
+        result['error'] = (
+            (result['error'] + ' | ') if result['error'] else ''
+        ) + f'Discord connectivity test failed: {error}'
+
+    return jsonify(result)
+
 @app.route('/test-alert')
 def test_alert():
  ok,err=validate_discord_webhook_url(DISCORD_WEBHOOK_URL)
