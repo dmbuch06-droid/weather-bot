@@ -7,7 +7,8 @@ import requests
 from flask import Flask,jsonify
 app=Flask(__name__)
 KALSHI_API_URL='https://api.elections.kalshi.com/trade-api/v2'
-DISCORD_WEBHOOK_URL=os.environ.get('DISCORD_WEBHOOK_URL','').strip()
+DISCORD_RELAY_URL=os.environ.get('DISCORD_RELAY_URL','').strip()
+DISCORD_RELAY_SECRET=os.environ.get('DISCORD_RELAY_SECRET','').strip()
 SCAN_INTERVAL_SECONDS=int(os.environ.get('SCAN_INTERVAL_SECONDS','300'))
 POINT_REFRESH_SECONDS=int(os.environ.get('POINT_REFRESH_SECONDS','1800'))
 ENSEMBLE_REFRESH_SECONDS=int(os.environ.get('ENSEMBLE_REFRESH_SECONDS','1800'))
@@ -59,38 +60,83 @@ def set_cache(s,t,data,metadata=None): persistent_state['cache'][ck(s,t)]={'retr
 def cache_is_fresh(e,secs): return bool(e and age_seconds(e.get('retrieved_at')) is not None and age_seconds(e.get('retrieved_at'))<secs)
 def cache_is_usable(e,secs): return bool(e and age_seconds(e.get('retrieved_at')) is not None and age_seconds(e.get('retrieved_at'))<=secs)
 def cached_result(e,status): return (e.get('data',{}),{'status':status,'retrieved_at':e.get('retrieved_at'),'age_seconds':age_seconds(e.get('retrieved_at')),'metadata':e.get('metadata',{})}) if e else ({},{'status':'missing','retrieved_at':None,'age_seconds':None,'metadata':{}})
-def validate_discord_webhook_url(url):
- if not url:return False,'DISCORD_WEBHOOK_URL is empty'
- try:
-  p=urlparse(url); host=(p.hostname or '').lower()
-  if p.scheme!='https':return False,'Discord webhook URL must use HTTPS'
-  if host not in {'discord.com','discordapp.com','canary.discord.com','ptb.discord.com'}:return False,f'Unexpected Discord webhook host: {host}'
-  parts=[x for x in p.path.split('/') if x]
-  if 'webhooks' not in parts:return False,'URL does not appear to be a Discord webhook URL'
-  i=parts.index('webhooks')
-  if len(parts)<i+3:return False,'Discord webhook ID or token is missing'
-  return True,None
- except Exception as e:return False,f'Webhook URL validation error: {e}'
+def validate_discord_relay():
+ if not DISCORD_RELAY_URL:
+  return False,'DISCORD_RELAY_URL is empty'
+ if not DISCORD_RELAY_SECRET:
+  return False,'DISCORD_RELAY_SECRET is empty'
+ if not DISCORD_RELAY_URL.startswith('https://script.google.com/macros/s/') or not DISCORD_RELAY_URL.endswith('/exec'):
+  return False,'DISCORD_RELAY_URL does not look like the Google Apps Script web-app URL'
+ return True,None
+
 def send_discord_alert(message):
- ok,err=validate_discord_webhook_url(DISCORD_WEBHOOK_URL)
- if not ok: print(f'Discord configuration error: {err}',flush=True); bot_status['discord_last_error']=err; return False
- headers={'User-Agent':'WeatherKalshiPaperMonitor/1.0 (Render Python)','Accept':'application/json'}; payload={'content':message,'allowed_mentions':{'parse':[]}}
+ ok,err=validate_discord_relay()
+ if not ok:
+  print(f'Discord relay configuration error: {err}',flush=True)
+  bot_status['discord_last_status']=None
+  bot_status['discord_last_error']=err
+  return False
+
+ payload={'secret':DISCORD_RELAY_SECRET,'message':message}
+ headers={
+  'User-Agent':'WeatherKalshiPaperMonitor/1.0 (Render)',
+  'Content-Type':'application/json',
+  'Accept':'application/json',
+ }
+
  for attempt in range(1,4):
   try:
-   r=requests.post(DISCORD_WEBHOOK_URL,json=payload,headers=headers,timeout=REQUEST_TIMEOUT); bot_status['discord_last_status']=r.status_code; print(f'Discord response: {r.status_code} (attempt {attempt}/3)',flush=True)
-   if 200<=r.status_code<300:bot_status['discord_last_error']=None; return True
-   body=r.text[:500]; low=body.lower()
-   if r.status_code==429 and ('cloudflare' not in low and 'access denied' not in low) and attempt<3:
-    try:wait=safe_float(r.json().get('retry_after'),2.0)
-    except:wait=2.0
-    wait=max(.5,min(wait,30)); print(f'Discord API rate limited. Waiting {wait:.1f}s.',flush=True); time.sleep(wait+.25); continue
-   err='Discord request was blocked by Cloudflare/access controls. Verify DISCORD_WEBHOOK_URL is the exact fresh URL copied from Discord with no quotes or extra characters.' if ('cloudflare' in low or 'access denied' in low) else f'Discord HTTP {r.status_code}: {body}'
-   print(f'Discord error: {err}',flush=True); bot_status['discord_last_error']=err; return False
+   r=requests.post(DISCORD_RELAY_URL,json=payload,headers=headers,timeout=REQUEST_TIMEOUT)
+   bot_status['discord_last_status']=r.status_code
+   print(f'Discord relay response: {r.status_code} (attempt {attempt}/3)',flush=True)
+
+   content_type=r.headers.get('content-type','').lower()
+   data=None
+   if 'application/json' in content_type:
+    try:data=r.json()
+    except Exception:data=None
+
+   if r.status_code>=200 and r.status_code<300:
+    if isinstance(data,dict) and data.get('success') is False:
+     err=data.get('error') or data.get('discord_response') or 'Relay reported failure.'
+     bot_status['discord_last_error']=err
+     print(f'Discord relay reported failure: {err}',flush=True)
+     return False
+    bot_status['discord_last_error']=None
+    print('Discord alert delivered through relay.',flush=True)
+    return True
+
+   if r.status_code==429 and attempt<3:
+    retry_after=2.0
+    if isinstance(data,dict):
+     retry_after=safe_float(data.get('retry_after'),2.0) or 2.0
+    retry_after=max(0.5,min(retry_after,30.0))
+    print(f'Discord relay returned 429. Waiting {retry_after:.1f}s.',flush=True)
+    time.sleep(retry_after+0.25)
+    continue
+
+   body=r.text[:1000]
+   err=f'Discord relay HTTP {r.status_code}: {body}'
+   bot_status['discord_last_error']=err
+   print(err,flush=True)
+   return False
+
   except requests.RequestException as e:
-   err=f'Discord request exception: {e}'; print(err,flush=True); bot_status['discord_last_error']=err
-   if attempt<3:time.sleep(attempt*2); continue
+   err=f'Discord relay request exception: {e}'
+   bot_status['discord_last_error']=err
+   print(err,flush=True)
+   if attempt<3:
+    time.sleep(attempt*2)
+    continue
+   return False
+
+  except Exception as e:
+   err=f'Unexpected Discord relay error: {e}'
+   bot_status['discord_last_error']=err
+   print(err,flush=True)
    return False
  return False
+
 def fetch_point_forecast(city):
  p={'latitude':city['lat'],'longitude':city['lon'],'daily':'temperature_2m_max,precipitation_sum','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':city['timezone'],'forecast_days':FORECAST_DAYS}; r=requests.get('https://api.open-meteo.com/v1/forecast',params=p,timeout=REQUEST_TIMEOUT); print(f'Point forecast status: {r.status_code}',flush=True)
  if r.status_code!=200:raise RuntimeError(f'HTTP_{r.status_code}|{r.text[:500]}')
@@ -227,7 +273,22 @@ def background_scanner():
 def home():return 'Weather + Kalshi paper-trading monitor is running. Use /health, /status, /paper-trades, /network-test, or /test-alert.'
 @app.route('/health')
 def health():
- ok,err=validate_discord_webhook_url(DISCORD_WEBHOOK_URL); return jsonify({'status':'ok','bot':bot_status,'discord_configured':bool(DISCORD_WEBHOOK_URL),'discord_webhook_url_valid':ok,'discord_webhook_validation_error':err,'cities':list(CITIES),'state_file':STATE_FILE,'state_version':STATE_VERSION,'cache_entries':len(persistent_state.get('cache',{})),'forecast_entries':len(persistent_state.get('forecasts',{})),'paper_trade_count':len(persistent_state.get('paper_trades',[]))})
+ ok,err=validate_discord_relay()
+ return jsonify({
+  'status':'ok',
+  'bot':bot_status,
+  'discord_relay_configured':bool(DISCORD_RELAY_URL),
+  'discord_relay_secret_configured':bool(DISCORD_RELAY_SECRET),
+  'discord_relay_valid':ok,
+  'discord_relay_error':err,
+  'cities':list(CITIES),
+  'state_file':STATE_FILE,
+  'state_version':STATE_VERSION,
+  'cache_entries':len(persistent_state.get('cache',{})),
+  'forecast_entries':len(persistent_state.get('forecasts',{})),
+  'paper_trade_count':len(persistent_state.get('paper_trades',[])),
+ })
+
 @app.route('/status')
 def status():return jsonify(bot_status)
 @app.route('/paper-trades')
@@ -236,76 +297,65 @@ def paper_trades():return jsonify(persistent_state.get('paper_trades',[])[-100:]
 def debug_state():return jsonify({'cache':persistent_state.get('cache',{}),'forecasts':persistent_state.get('forecasts',{}),'alerts':persistent_state.get('alerts',{})})
 @app.route('/network-test')
 def network_test():
-    # Diagnostic endpoint: reports the public IP used by Render and
-    # tests whether Discord's webhook endpoint is reachable. It never
-    # returns the webhook URL or webhook token.
-    result = {
-        'public_ip': None,
-        'ip_lookup_status': None,
-        'discord_webhook_url_valid': False,
-        'discord_get_status': None,
-        'discord_get_content_type': None,
-        'discord_cloudflare_block': False,
-        'error': None,
+ result={
+  'relay_url_configured':bool(DISCORD_RELAY_URL),
+  'relay_secret_configured':bool(DISCORD_RELAY_SECRET),
+  'relay_url_valid':False,
+  'relay_get_status':None,
+  'relay_get_content_type':None,
+  'relay_get_response':None,
+  'error':None,
+ }
+ ok,err=validate_discord_relay()
+ result['relay_url_valid']=ok
+ if not ok:
+  result['error']=err
+  return jsonify(result),500
+ try:
+  r=requests.get(
+   DISCORD_RELAY_URL,
+   headers={'User-Agent':'WeatherKalshiPaperMonitor/1.0 (Render)','Accept':'application/json'},
+   timeout=REQUEST_TIMEOUT,
+  )
+  result['relay_get_status']=r.status_code
+  result['relay_get_content_type']=r.headers.get('content-type')
+  try:
+   data=r.json()
+   if isinstance(data,dict):
+    result['relay_get_response']={
+     'status':data.get('status'),
+     'service':data.get('service'),
+     'discord_configured':data.get('discord_configured'),
+     'secret_configured':data.get('secret_configured'),
     }
-
-    ok, err = validate_discord_webhook_url(DISCORD_WEBHOOK_URL)
-    result['discord_webhook_url_valid'] = ok
-    if not ok:
-        result['error'] = err
-        return jsonify(result), 500
-
-    try:
-        ip_response = requests.get(
-            'https://api.ipify.org?format=json',
-            headers={
-                'User-Agent': 'WeatherKalshiPaperMonitor/1.0',
-                'Accept': 'application/json',
-            },
-            timeout=10,
-        )
-        result['ip_lookup_status'] = ip_response.status_code
-        if ip_response.status_code == 200:
-            try:
-                result['public_ip'] = ip_response.json().get('ip')
-            except Exception:
-                result['public_ip'] = ip_response.text.strip()[:100]
-    except Exception as error:
-        result['error'] = f'Public IP lookup failed: {error}'
-
-    try:
-        discord_response = requests.get(
-            DISCORD_WEBHOOK_URL,
-            headers={
-                'User-Agent': 'WeatherKalshiPaperMonitor/1.0',
-                'Accept': 'application/json',
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-
-        result['discord_get_status'] = discord_response.status_code
-        result['discord_get_content_type'] = discord_response.headers.get('content-type')
-
-        body = discord_response.text[:1000].lower()
-        result['discord_cloudflare_block'] = (
-            'access denied' in body
-            or 'cloudflare' in body
-        )
-
-    except Exception as error:
-        result['error'] = (
-            (result['error'] + ' | ') if result['error'] else ''
-        ) + f'Discord connectivity test failed: {error}'
-
-    return jsonify(result)
+   else:
+    result['relay_get_response']=str(data)[:500]
+  except Exception:
+   result['relay_get_response']=r.text[:500]
+ except Exception as e:
+  result['error']=str(e)
+  return jsonify(result),500
+ return jsonify(result)
 
 @app.route('/test-alert')
 def test_alert():
- ok,err=validate_discord_webhook_url(DISCORD_WEBHOOK_URL)
- if not ok:return jsonify({'success':False,'error':err,'instructions':'In Render, set DISCORD_WEBHOOK_URL to the complete webhook URL copied directly from Discord Channel Settings > Integrations > Webhooks > Copy Webhook URL.'}),500
- success=send_discord_alert('🧪 **WEATHER BOT TEST ALERT**\n\nThis is a test message only.\nNo trade signal was generated.')
- if success:return jsonify({'success':True,'message':'Test Discord alert sent successfully.'})
- return jsonify({'success':False,'discord_status':bot_status.get('discord_last_status'),'error':bot_status.get('discord_last_error'),'instructions':'If the error mentions Cloudflare access denied, delete the existing DISCORD_WEBHOOK_URL in Render and paste a freshly copied webhook URL directly from Discord without quotes.'}),500
+ ok,err=validate_discord_relay()
+ if not ok:
+  return jsonify({'success':False,'error':err}),500
+ success=send_discord_alert(
+  '🧪 **WEATHER BOT RELAY TEST**\n\n'
+  'Render successfully reached the Google Apps Script relay.\n'
+  'The relay attempted to deliver this message to Discord.\n\n'
+  'This is a test message only.'
+ )
+ if success:
+  return jsonify({'success':True,'message':'Test Discord alert sent successfully through the relay.'})
+ return jsonify({
+  'success':False,
+  'relay_status':bot_status.get('discord_last_status'),
+  'error':bot_status.get('discord_last_error'),
+ }),500
+
 load_state(); threading.Thread(target=background_scanner,daemon=True,name='weather-market-scanner').start()
 if __name__=='__main__':
  port=int(os.environ.get('PORT','10000')); print(f'Starting server on port {port}',flush=True); app.run(host='0.0.0.0',port=port,debug=False)
