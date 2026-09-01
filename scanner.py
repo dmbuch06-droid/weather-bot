@@ -2,953 +2,1870 @@ import hashlib
 import json
 import logging
 import os
-import re
 import statistics
 import time
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-import requests
 try:
     import psycopg2
-    from psycopg2.extras import Json
+    from psycopg2.extras import Json, execute_values
 except ImportError:
     psycopg2 = None
     Json = None
+    execute_values = None
 
+import requests
+
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
 
 KALSHI_API_URL = os.environ.get(
     "KALSHI_API_URL",
     "https://external-api.kalshi.com/trade-api/v2",
 ).rstrip("/")
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-DISCORD_RELAY_URL = os.environ.get("DISCORD_RELAY_URL", "").strip()
-DISCORD_RELAY_SECRET = os.environ.get("DISCORD_RELAY_SECRET", "").strip()
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
-FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
-WEATHER_REFRESH_SECONDS = int(
-    os.environ.get("WEATHER_REFRESH_SECONDS", "1800")
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "",
+).strip()
+
+DISCORD_RELAY_URL = os.environ.get(
+    "DISCORD_RELAY_URL",
+    "",
+).strip()
+
+DISCORD_RELAY_SECRET = os.environ.get(
+    "DISCORD_RELAY_SECRET",
+    "",
+).strip()
+
+REQUEST_TIMEOUT = int(
+    os.environ.get("REQUEST_TIMEOUT", "15")
 )
+
+FORECAST_DAYS = int(
+    os.environ.get("FORECAST_DAYS", "3")
+)
+
+SCAN_WORKERS = int(
+    os.environ.get("SCAN_WORKERS", "6")
+)
+
 MIN_FORECAST_PROBABILITY_CHANGE_POINTS = float(
-    os.environ.get("MIN_FORECAST_PROBABILITY_CHANGE_POINTS", "20")
+    os.environ.get(
+        "MIN_FORECAST_PROBABILITY_CHANGE_POINTS",
+        "20",
+    )
 )
+
+MIN_TEMPERATURE_CHANGE_F = float(
+    os.environ.get(
+        "MIN_TEMPERATURE_CHANGE_F",
+        "1",
+    )
+)
+
 MIN_MARKET_LAG_POINTS = float(
-    os.environ.get("MIN_MARKET_LAG_POINTS", "10")
+    os.environ.get(
+        "MIN_MARKET_LAG_POINTS",
+        "10",
+    )
 )
+
 MIN_PRELIMINARY_EDGE_POINTS = float(
-    os.environ.get("MIN_PRELIMINARY_EDGE_POINTS", "10")
+    os.environ.get(
+        "MIN_PRELIMINARY_EDGE_POINTS",
+        "10",
+    )
 )
+
 MIN_ENTRY_PRICE_CENTS = float(
-    os.environ.get("MIN_ENTRY_PRICE_CENTS", "5")
+    os.environ.get(
+        "MIN_ENTRY_PRICE_CENTS",
+        "5",
+    )
 )
+
 MAX_ENTRY_PRICE_CENTS = float(
-    os.environ.get("MAX_ENTRY_PRICE_CENTS", "95")
+    os.environ.get(
+        "MAX_ENTRY_PRICE_CENTS",
+        "95",
+    )
 )
+
 PAPER_RISK_DOLLARS = float(
-    os.environ.get("PAPER_RISK_DOLLARS", "10")
+    os.environ.get(
+        "PAPER_RISK_DOLLARS",
+        "10",
+    )
 )
-ALLOW_UNVERIFIED_LOCATION_SIGNALS = os.environ.get(
-    "ALLOW_UNVERIFIED_LOCATION_SIGNALS", "false"
-).lower() in {"1", "true", "yes"}
+
+ALLOW_UNVERIFIED_SIGNALS = (
+    os.environ.get(
+        "ALLOW_UNVERIFIED_SIGNALS",
+        "false",
+    ).lower()
+    in {"1", "true", "yes"}
+)
+
+# We do not claim a model-run timestamp unless Open-Meteo actually
+# returns one in the response.
+WEATHER_MODELS = (
+    "hrrr",
+    "nbm",
+    "gfs_seamless",
+    "ecmwf_ifs025",
+)
+
 ENSEMBLE_MODEL = "gfs_seamless"
+
+
+# ==========================================================
+# CITY / STATION MAPPINGS
+# ==========================================================
+#
+# Forecast points for the first four cities are aligned to the
+# current Kalshi daily-temperature station descriptions:
+# NYC = Central Park
+# Chicago = Chicago Midway
+# Miami = Miami International Airport
+# Austin = Austin Bergstrom
+#
+# The other locations are monitored, but paper signals are
+# disabled by default until their exact current settlement
+# station/forecast-point mapping is independently verified.
+#
+
+CITIES = {
+    "New York": {
+        "aliases": ("new york", "new york city", "nyc"),
+        "lat": 40.78,
+        "lon": -73.97,
+        "timezone": "America/New_York",
+        "rain_code": "NYC",
+        "signal_eligible": True,
+        "station": "Central Park",
+    },
+    "Chicago": {
+        "aliases": ("chicago",),
+        "lat": 41.7870,
+        "lon": -87.7717,
+        "timezone": "America/Chicago",
+        "rain_code": "CHI",
+        "signal_eligible": True,
+        "station": "Chicago Midway",
+    },
+    "Miami": {
+        "aliases": ("miami",),
+        "lat": 25.7959,
+        "lon": -80.2870,
+        "timezone": "America/New_York",
+        "rain_code": "MIA",
+        "signal_eligible": True,
+        "station": "Miami International Airport",
+    },
+    "Austin": {
+        "aliases": ("austin",),
+        "lat": 30.1975,
+        "lon": -97.6663,
+        "timezone": "America/Chicago",
+        "rain_code": "AUS",
+        "signal_eligible": True,
+        "station": "Austin Bergstrom",
+    },
+    "Los Angeles": {
+        "aliases": ("los angeles", "la"),
+        "lat": 33.9425,
+        "lon": -118.4081,
+        "timezone": "America/Los_Angeles",
+        "rain_code": "LAX",
+        "signal_eligible": False,
+        "station": "LAX proxy",
+    },
+    "Dallas": {
+        "aliases": ("dallas",),
+        "lat": 32.8998,
+        "lon": -97.0403,
+        "timezone": "America/Chicago",
+        "rain_code": "DAL",
+        "signal_eligible": False,
+        "station": "DFW proxy",
+    },
+    "Seattle": {
+        "aliases": ("seattle",),
+        "lat": 47.4502,
+        "lon": -122.3088,
+        "timezone": "America/Los_Angeles",
+        "rain_code": "SEA",
+        "signal_eligible": False,
+        "station": "SEA proxy",
+    },
+    "Houston": {
+        "aliases": ("houston",),
+        "lat": 29.6454,
+        "lon": -95.2789,
+        "timezone": "America/Chicago",
+        "rain_code": "HOU",
+        "signal_eligible": False,
+        "station": "Houston proxy",
+    },
+    "Oklahoma City": {
+        "aliases": ("oklahoma city",),
+        "lat": 35.3931,
+        "lon": -97.6007,
+        "timezone": "America/Chicago",
+        "rain_code": "OKC",
+        "signal_eligible": False,
+        "station": "OKC proxy",
+    },
+    "Philadelphia": {
+        "aliases": ("philadelphia", "philly"),
+        "lat": 39.8744,
+        "lon": -75.2424,
+        "timezone": "America/New_York",
+        "rain_code": "PHIL",
+        "signal_eligible": False,
+        "station": "PHL proxy",
+    },
+    "Phoenix": {
+        "aliases": ("phoenix",),
+        "lat": 33.4342,
+        "lon": -112.0116,
+        "timezone": "America/Phoenix",
+        "rain_code": "PHX",
+        "signal_eligible": False,
+        "station": "PHX proxy",
+    },
+    "San Francisco": {
+        "aliases": ("san francisco", "sf"),
+        "lat": 37.6213,
+        "lon": -122.3790,
+        "timezone": "America/Los_Angeles",
+        "rain_code": "SFO",
+        "signal_eligible": False,
+        "station": "SFO proxy",
+    },
+    "Las Vegas": {
+        "aliases": ("las vegas", "vegas"),
+        "lat": 36.0840,
+        "lon": -115.1537,
+        "timezone": "America/Los_Angeles",
+        "rain_code": "LV",
+        "signal_eligible": False,
+        "station": "LAS proxy",
+    },
+    "Minneapolis": {
+        "aliases": ("minneapolis",),
+        "lat": 44.8848,
+        "lon": -93.2223,
+        "timezone": "America/Chicago",
+        "rain_code": "MIN",
+        "signal_eligible": False,
+        "station": "MSP proxy",
+    },
+    "New Orleans": {
+        "aliases": ("new orleans",),
+        "lat": 30.0424,
+        "lon": -90.0289,
+        "timezone": "America/Chicago",
+        "rain_code": "NOLA",
+        "signal_eligible": False,
+        "station": "MSY proxy",
+    },
+    "Denver": {
+        "aliases": ("denver",),
+        "lat": 39.8561,
+        "lon": -104.6737,
+        "timezone": "America/Denver",
+        "rain_code": "DEN",
+        "signal_eligible": False,
+        "station": "DEN proxy",
+    },
+    "Trenton": {
+        "aliases": ("trenton",),
+        "lat": 40.2767,
+        "lon": -74.8135,
+        "timezone": "America/New_York",
+        "rain_code": "TTN",
+        "signal_eligible": False,
+        "station": "TTN proxy",
+    },
+    "Newark": {
+        "aliases": ("newark",),
+        "lat": 40.6895,
+        "lon": -74.1745,
+        "timezone": "America/New_York",
+        "rain_code": "EWR",
+        "signal_eligible": False,
+        "station": "EWR proxy",
+    },
+    "Washington DC": {
+        "aliases": (
+            "washington dc",
+            "washington d.c.",
+            "washington",
+        ),
+        "lat": 38.8512,
+        "lon": -77.0402,
+        "timezone": "America/New_York",
+        "rain_code": "DC",
+        "signal_eligible": False,
+        "station": "DCA proxy",
+    },
+    "Boston": {
+        "aliases": ("boston",),
+        "lat": 42.3656,
+        "lon": -71.0096,
+        "timezone": "America/New_York",
+        "rain_code": "BOS",
+        "signal_eligible": False,
+        "station": "BOS proxy",
+    },
+    "Atlanta": {
+        "aliases": ("atlanta",),
+        "lat": 33.6407,
+        "lon": -84.4277,
+        "timezone": "America/New_York",
+        "rain_code": "ATL",
+        "signal_eligible": False,
+        "station": "ATL proxy",
+    },
+    "San Antonio": {
+        "aliases": ("san antonio",),
+        "lat": 29.5337,
+        "lon": -98.4698,
+        "timezone": "America/Chicago",
+        "rain_code": "SATX",
+        "signal_eligible": False,
+        "station": "SATX proxy",
+    },
+}
+
+RAIN_CODE_TO_CITY = {
+    item["rain_code"]: name
+    for name, item in CITIES.items()
+}
+
+
+# ==========================================================
+# LOGGING / HTTP
+# ==========================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("weather-kalshi-scanner")
 
-
-# Forecast proxy coordinates. These are not asserted to be legal Kalshi
-# settlement coordinates. Only entries marked True may signal by default.
-LOCATION_MAP = {
-    "NYC": ("New York City", 40.7789, -73.9692, "America/New_York", True),
-    "CHI": ("Chicago", 41.9742, -87.9073, "America/Chicago", False),
-    "MIA": ("Miami", 25.7959, -80.2870, "America/New_York", False),
-    "AUS": ("Austin", 30.1975, -97.6663, "America/Chicago", False),
-    "LAX": ("Los Angeles", 33.9425, -118.4081, "America/Los_Angeles", False),
-    "DAL": ("Dallas", 32.8998, -97.0403, "America/Chicago", False),
-    "SEA": ("Seattle", 47.4502, -122.3088, "America/Los_Angeles", False),
-    "HOU": ("Houston", 29.6454, -95.2789, "America/Chicago", False),
-    "OKC": ("Oklahoma City", 35.3931, -97.6007, "America/Chicago", False),
-    "PHIL": ("Philadelphia", 39.8744, -75.2424, "America/New_York", False),
-    "PHX": ("Phoenix", 33.4342, -112.0116, "America/Phoenix", False),
-    "SFO": ("San Francisco", 37.6213, -122.3790, "America/Los_Angeles", False),
-    "LV": ("Las Vegas", 36.0840, -115.1537, "America/Los_Angeles", False),
-    "MIN": ("Minneapolis", 44.8848, -93.2223, "America/Chicago", False),
-    "NOLA": ("New Orleans", 30.0424, -90.0289, "America/Chicago", False),
-    "DEN": ("Denver", 39.8561, -104.6737, "America/Denver", False),
-    "TTN": ("Trenton", 40.2767, -74.8135, "America/New_York", False),
-    "EWR": ("Newark", 40.6895, -74.1745, "America/New_York", False),
-    "DC": ("Washington DC", 38.8512, -77.0402, "America/New_York", False),
-    "BOS": ("Boston", 42.3656, -71.0096, "America/New_York", False),
-    "ATL": ("Atlanta", 33.6407, -84.4277, "America/New_York", False),
-    "SATX": ("San Antonio", 29.5337, -98.4698, "America/Chicago", False),
-}
+logger = logging.getLogger(
+    "weather-kalshi-scanner"
+)
 
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-def safe_float(value, default=None):
+def safe_float(
+    value: Any,
+    default: Optional[float] = None,
+):
     try:
-        return float(value) if value is not None else default
+        if value is None:
+            return default
+        return float(value)
     except (TypeError, ValueError):
         return default
 
 
-def db_conn():
+def request_json(
+    session: requests.Session,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+):
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                headers={
+                    "User-Agent": (
+                        "WeatherKalshiResearchBot/4.0"
+                    ),
+                    "Accept": "application/json",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 429:
+                retry_after = safe_float(
+                    response.headers.get(
+                        "Retry-After"
+                    ),
+                    2.0,
+                ) or 2.0
+
+                time.sleep(
+                    min(
+                        max(
+                            retry_after,
+                            0.5,
+                        ),
+                        10.0,
+                    )
+                )
+                continue
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    "Expected a JSON object."
+                )
+
+            if payload.get("error"):
+                raise RuntimeError(
+                    f"API error: {payload['error']}"
+                )
+
+            return payload
+
+        except Exception as error:
+            last_error = error
+
+            if attempt < 2:
+                time.sleep(
+                    1.5 * (attempt + 1)
+                )
+
+    raise RuntimeError(
+        f"Request failed after retries: {last_error}"
+    )
+
+
+# ==========================================================
+# DATABASE
+# ==========================================================
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS bot_runs (
+    run_id BIGSERIAL PRIMARY KEY,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    success BOOLEAN,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS forecast_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    city TEXT NOT NULL,
+    source TEXT NOT NULL,
+    variable TEXT NOT NULL,
+    forecast_date DATE NOT NULL,
+    model_run_time TEXT,
+    value DOUBLE PRECISION,
+    probability_proxy DOUBLE PRECISION,
+    payload JSONB NOT NULL,
+    payload_hash TEXT NOT NULL,
+    UNIQUE(
+        city,
+        source,
+        variable,
+        forecast_date,
+        payload_hash
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_latest
+ON forecast_observations(
+    city,
+    source,
+    variable,
+    forecast_date,
+    observed_at DESC
+);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ticker TEXT NOT NULL,
+    event_ticker TEXT,
+    series_ticker TEXT,
+    market_date DATE,
+    city TEXT,
+    market_kind TEXT NOT NULL,
+    yes_bid_cents DOUBLE PRECISION,
+    yes_ask_cents DOUBLE PRECISION,
+    no_bid_cents DOUBLE PRECISION,
+    no_ask_cents DOUBLE PRECISION,
+    last_price_cents DOUBLE PRECISION,
+    status TEXT,
+    result TEXT,
+    raw_market JSONB NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_latest
+ON market_snapshots(ticker, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id BIGSERIAL PRIMARY KEY,
+    signal_fingerprint TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    settled_at TIMESTAMPTZ,
+    city TEXT NOT NULL,
+    forecast_date DATE NOT NULL,
+    ticker TEXT NOT NULL,
+    market_kind TEXT NOT NULL,
+    side TEXT NOT NULL CHECK(side IN ('YES','NO')),
+    entry_price_cents DOUBLE PRECISION NOT NULL,
+    risk_dollars DOUBLE PRECISION NOT NULL,
+    contracts DOUBLE PRECISION NOT NULL,
+    model_probability_proxy DOUBLE PRECISION NOT NULL,
+    preliminary_edge_points DOUBLE PRECISION NOT NULL,
+    forecast_change_points DOUBLE PRECISION NOT NULL,
+    market_change_points DOUBLE PRECISION,
+    market_lag_points DOUBLE PRECISION NOT NULL,
+    forecast_temperature_change_f DOUBLE PRECISION,
+    reason JSONB NOT NULL,
+    result TEXT,
+    profit_loss_dollars DOUBLE PRECISION,
+    status TEXT NOT NULL DEFAULT 'open'
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_status
+ON paper_trades(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS alert_log (
+    fingerprint TEXT PRIMARY KEY,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    message JSONB NOT NULL
+);
+"""
+
+
+def db_connect():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured")
+        raise RuntimeError(
+            "DATABASE_URL is not configured."
+        )
     if psycopg2 is None:
-        raise RuntimeError("psycopg2-binary is not installed")
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        raise RuntimeError(
+            "psycopg2-binary is not installed."
+        )
 
-
-def db_execute(sql, params=None, fetch=False, fetchone=False):
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            if fetchone:
-                result = cur.fetchone()
-            elif fetch:
-                result = cur.fetchall()
-            else:
-                result = None
-        conn.commit()
-        return result
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+    )
 
 
 def ensure_schema():
-    statements = [
-        """
-        CREATE TABLE IF NOT EXISTS scan_runs (
-            id BIGSERIAL PRIMARY KEY,
-            started_at TIMESTAMPTZ NOT NULL,
-            completed_at TIMESTAMPTZ,
-            status TEXT NOT NULL,
-            stats JSONB NOT NULL DEFAULT '{}'::jsonb,
-            error TEXT
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS series_registry (
-            series_ticker TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            category TEXT,
-            tags JSONB NOT NULL,
-            settlement_sources JSONB NOT NULL,
-            contract_terms_url TEXT,
-            updated_at TIMESTAMPTZ NOT NULL,
-            raw_series JSONB NOT NULL
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS forecast_observations (
-            id BIGSERIAL PRIMARY KEY,
-            observed_at TIMESTAMPTZ NOT NULL,
-            city TEXT NOT NULL,
-            variable TEXT NOT NULL,
-            model TEXT NOT NULL,
-            forecast_date DATE NOT NULL,
-            scalar_value DOUBLE PRECISION,
-            payload JSONB NOT NULL,
-            payload_hash TEXT NOT NULL,
-            UNIQUE(city, variable, model, forecast_date, payload_hash)
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_forecast_lookup
-        ON forecast_observations(city, variable, model, forecast_date, observed_at DESC)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS market_snapshots (
-            id BIGSERIAL PRIMARY KEY,
-            observed_at TIMESTAMPTZ NOT NULL,
-            ticker TEXT NOT NULL,
-            event_ticker TEXT,
-            series_ticker TEXT,
-            market_date DATE,
-            city TEXT,
-            market_kind TEXT NOT NULL,
-            strike_type TEXT,
-            floor_strike DOUBLE PRECISION,
-            cap_strike DOUBLE PRECISION,
-            yes_bid_cents DOUBLE PRECISION,
-            yes_ask_cents DOUBLE PRECISION,
-            no_bid_cents DOUBLE PRECISION,
-            no_ask_cents DOUBLE PRECISION,
-            last_price_cents DOUBLE PRECISION,
-            status TEXT,
-            result TEXT
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_market_lookup
-        ON market_snapshots(ticker, observed_at DESC)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS paper_trades (
-            id BIGSERIAL PRIMARY KEY,
-            signal_fingerprint TEXT UNIQUE NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL,
-            settled_at TIMESTAMPTZ,
-            city TEXT NOT NULL,
-            forecast_date DATE NOT NULL,
-            market_ticker TEXT NOT NULL,
-            market_kind TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry_price_cents DOUBLE PRECISION NOT NULL,
-            stake_dollars DOUBLE PRECISION NOT NULL,
-            contracts DOUBLE PRECISION NOT NULL,
-            model_probability_proxy DOUBLE PRECISION NOT NULL,
-            preliminary_edge_points DOUBLE PRECISION NOT NULL,
-            forecast_probability_change_points DOUBLE PRECISION NOT NULL,
-            market_price_change_points DOUBLE PRECISION NOT NULL,
-            market_lag_points DOUBLE PRECISION NOT NULL,
-            forecast_temperature_change_f DOUBLE PRECISION,
-            reason JSONB NOT NULL,
-            result TEXT,
-            profit_loss_dollars DOUBLE PRECISION,
-            status TEXT NOT NULL DEFAULT 'open'
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_paper_status
-        ON paper_trades(status, created_at DESC)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS alert_log (
-            fingerprint TEXT PRIMARY KEY,
-            sent_at TIMESTAMPTZ NOT NULL,
-            payload JSONB NOT NULL
-        )
-        """,
-    ]
-    for sql in statements:
-        db_execute(sql)
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            for statement in SCHEMA.split(";"):
+                statement = statement.strip()
+
+                if statement:
+                    cur.execute(
+                        statement
+                    )
 
 
-def get_latest_weather_fetch_time():
-    row = db_execute(
-        """
-        SELECT MAX(started_at)
-        FROM scan_runs
-        WHERE status='success'
-          AND (stats->>'weather_refreshed')='true'
-        """,
-        fetchone=True,
-    )
-    return row[0] if row and row[0] else None
+def begin_run():
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_runs(success)
+                VALUES(NULL)
+                RETURNING run_id
+                """
+            )
+            return int(
+                cur.fetchone()[0]
+            )
 
 
-def payload_hash(payload):
-    raw = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+def finish_run(
+    run_id,
+    success,
+    error=None,
+):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bot_runs
+                SET finished_at=NOW(),
+                    success=%s,
+                    error=%s
+                WHERE run_id=%s
+                """,
+                (
+                    success,
+                    error,
+                    run_id,
+                ),
+            )
 
 
-def insert_forecast(city, variable, model, date_key, scalar, payload):
-    db_execute(
+def read_previous_forecasts(
+    conn,
+    keys,
+):
+    """
+    keys: list of (city, source, variable, forecast_date)
+    """
+    result = {}
+
+    if not keys:
+        return result
+
+    with conn.cursor() as cur:
+        for (
+            city,
+            source,
+            variable,
+            forecast_date,
+        ) in keys:
+            cur.execute(
+                """
+                SELECT
+                    observed_at,
+                    value,
+                    probability_proxy,
+                    model_run_time,
+                    payload
+                FROM forecast_observations
+                WHERE city=%s
+                  AND source=%s
+                  AND variable=%s
+                  AND forecast_date=%s
+                ORDER BY observed_at DESC
+                LIMIT 1
+                """,
+                (
+                    city,
+                    source,
+                    variable,
+                    forecast_date,
+                ),
+            )
+
+            row = cur.fetchone()
+
+            if row is not None:
+                result[
+                    (
+                        city,
+                        source,
+                        variable,
+                        forecast_date,
+                    )
+                ] = row
+
+    return result
+
+
+def read_previous_markets(
+    conn,
+    tickers,
+):
+    result = {}
+
+    if not tickers:
+        return result
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (ticker)
+                ticker,
+                observed_at,
+                yes_bid_cents,
+                yes_ask_cents,
+                no_bid_cents,
+                no_ask_cents,
+                last_price_cents,
+                status,
+                result
+            FROM market_snapshots
+            WHERE ticker = ANY(%s)
+            ORDER BY ticker, observed_at DESC
+            """,
+            (
+                list(tickers),
+            ),
+        )
+
+        for row in cur.fetchall():
+            result[
+                row[0]
+            ] = row[1:]
+
+    return result
+
+
+def store_forecasts(
+    conn,
+    rows,
+):
+    if not rows:
+        return
+
+    execute_values(
+        conn.cursor(),
         """
         INSERT INTO forecast_observations(
-            observed_at,city,variable,model,forecast_date,
-            scalar_value,payload,payload_hash
-        ) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT(city,variable,model,forecast_date,payload_hash)
+            observed_at,
+            city,
+            source,
+            variable,
+            forecast_date,
+            model_run_time,
+            value,
+            probability_proxy,
+            payload,
+            payload_hash
+        )
+        VALUES(
+            NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s
+        )
+        ON CONFLICT(
+            city,
+            source,
+            variable,
+            forecast_date,
+            payload_hash
+        )
         DO NOTHING
         """,
-        (
-            city,
-            variable,
-            model,
-            date_key,
-            scalar,
-            Json(payload),
-            payload_hash(payload),
-        ),
+        rows,
+        template=None,
+        page_size=500,
     )
 
 
-def latest_forecast(city, variable, model, date_key):
-    return db_execute(
-        """
-        SELECT observed_at, scalar_value, payload
-        FROM forecast_observations
-        WHERE city=%s AND variable=%s AND model=%s AND forecast_date=%s
-        ORDER BY observed_at DESC
-        LIMIT 1
-        """,
-        (city, variable, model, date_key),
-        fetchone=True,
-    )
+def store_markets(
+    conn,
+    rows,
+):
+    if not rows:
+        return
 
-
-def latest_market(ticker):
-    return db_execute(
-        """
-        SELECT observed_at, yes_bid_cents, yes_ask_cents,
-               no_bid_cents, no_ask_cents, last_price_cents
-        FROM market_snapshots
-        WHERE ticker=%s
-        ORDER BY observed_at DESC
-        LIMIT 1
-        """,
-        (ticker,),
-        fetchone=True,
-    )
-
-
-def parse_market_date(market):
-    event_ticker = market.get("event_ticker") or ""
-    for part in event_ticker.split("-"):
-        try:
-            return datetime.strptime(part, "%y%b%d").date().isoformat()
-        except ValueError:
-            continue
-    return None
-
-
-def get_connectionless_market_fields(market):
-    def cents(value):
-        value = safe_float(value)
-        return None if value is None else value * 100.0
-
-    return (
-        cents(market.get("yes_bid_dollars")),
-        cents(market.get("yes_ask_dollars")),
-        cents(market.get("no_bid_dollars")),
-        cents(market.get("no_ask_dollars")),
-        cents(market.get("last_price_dollars")),
-    )
-
-
-def insert_market_snapshot(market, city, kind):
-    yes_bid, yes_ask, no_bid, no_ask, last_price = (
-        get_connectionless_market_fields(market)
-    )
-    db_execute(
+    execute_values(
+        conn.cursor(),
         """
         INSERT INTO market_snapshots(
-            observed_at,ticker,event_ticker,series_ticker,market_date,
-            city,market_kind,strike_type,floor_strike,cap_strike,
-            yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,
-            last_price_cents,status,result
-        ) VALUES(
-            NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            observed_at,
+            ticker,
+            event_ticker,
+            series_ticker,
+            market_date,
+            city,
+            market_kind,
+            yes_bid_cents,
+            yes_ask_cents,
+            no_bid_cents,
+            no_ask_cents,
+            last_price_cents,
+            status,
+            result,
+            raw_market
+        )
+        VALUES(
+            NOW(),%s,%s,%s,%s,%s,%s,
+            %s,%s,%s,%s,%s,%s,%s,%s
         )
         """,
-        (
-            market.get("ticker") or "",
-            market.get("event_ticker"),
-            market.get("series_ticker"),
-            parse_market_date(market),
-            city,
-            kind,
-            market.get("strike_type"),
-            safe_float(market.get("floor_strike")),
-            safe_float(market.get("cap_strike")),
-            yes_bid,
-            yes_ask,
-            no_bid,
-            no_ask,
-            last_price,
-            market.get("status"),
-            market.get("result"),
-        ),
+        rows,
+        page_size=500,
     )
+
+
+# ==========================================================
+# WEATHER
+# ==========================================================
+
+def location_lists():
+    names = list(
+        CITIES.keys()
+    )
+
+    latitudes = ",".join(
+        str(
+            CITIES[name]["lat"]
+        )
+        for name in names
+    )
+
+    longitudes = ",".join(
+        str(
+            CITIES[name]["lon"]
+        )
+        for name in names
+    )
+
+    return names, latitudes, longitudes
+
+
+def parse_open_meteo_location_response(
+    response,
+    names,
+):
+    locations = (
+        response
+        if isinstance(response, list)
+        else [response]
+    )
+
+    if len(locations) != len(names):
+        raise RuntimeError(
+            "Open-Meteo returned "
+            f"{len(locations)} locations; "
+            f"expected {len(names)}."
+        )
+
+    return locations
+
+
+def aggregate_hourly_daily(
+    location_data,
+    city_name,
+):
+    hourly = location_data.get(
+        "hourly",
+        {},
+    )
+
+    times = hourly.get(
+        "time",
+        [],
+    )
+
+    temperatures = hourly.get(
+        "temperature_2m",
+        [],
+    )
+
+    precipitation = hourly.get(
+        "precipitation",
+        [],
+    )
+
+    timezone_name = CITIES[
+        city_name
+    ]["timezone"]
+
+    local_tz = ZoneInfo(
+        timezone_name
+    )
+
+    grouped = {}
+
+    for index, timestamp in enumerate(
+        times
+    ):
+        try:
+            dt = datetime.fromisoformat(
+                str(timestamp).replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+        except ValueError:
+            continue
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        forecast_date = (
+            dt.astimezone(
+                local_tz
+            ).date().isoformat()
+        )
+
+        bucket = grouped.setdefault(
+            forecast_date,
+            {
+                "temperatures": [],
+                "precipitation": [],
+            },
+        )
+
+        if index < len(
+            temperatures
+        ):
+            value = safe_float(
+                temperatures[index]
+            )
+            if value is not None:
+                bucket[
+                    "temperatures"
+                ].append(value)
+
+        if index < len(
+            precipitation
+        ):
+            value = safe_float(
+                precipitation[index]
+            )
+            if value is not None:
+                bucket[
+                    "precipitation"
+                ].append(value)
+
+    daily = {}
+
+    for forecast_date, bucket in grouped.items():
+        if not bucket[
+            "temperatures"
+        ]:
+            continue
+
+        daily[
+            forecast_date
+        ] = {
+            "high": max(
+                bucket["temperatures"]
+            ),
+            "precipitation_sum": sum(
+                bucket[
+                    "precipitation"
+                ]
+            ),
+        }
+
+    model_run_time = (
+        location_data.get(
+            "model_run_time"
+        )
+        or location_data.get(
+            "model_run_id"
+        )
+    )
+
+    return {
+        "daily": daily,
+        "model_run_time": (
+            str(model_run_time)
+            if model_run_time is not None
+            else None
+        ),
+    }
+
+
+def fetch_model(
+    session,
+    model,
+):
+    names, latitudes, longitudes = (
+        location_lists()
+    )
+
+    if model in {
+        "hrrr",
+        "nbm",
+    }:
+        url = (
+            "https://api.open-meteo.com/v1/gfs"
+        )
+    else:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+        )
+
+    payload = request_json(
+        session,
+        url,
+        {
+            "latitude": latitudes,
+            "longitude": longitudes,
+            "models": model,
+            "hourly": (
+                "temperature_2m,"
+                "precipitation"
+            ),
+            "temperature_unit": "fahrenheit",
+            "precipitation_unit": "inch",
+            "timezone": "UTC",
+            "forecast_days": FORECAST_DAYS,
+        },
+    )
+
+    locations = (
+        parse_open_meteo_location_response(
+            payload,
+            names,
+        )
+    )
+
+    return {
+        city_name: aggregate_hourly_daily(
+            location_data,
+            city_name,
+        )
+        for city_name, location_data
+        in zip(
+            names,
+            locations,
+        )
+    }
+
+
+def fetch_ensemble(
+    session,
+):
+    names, latitudes, longitudes = (
+        location_lists()
+    )
+
+    payload = request_json(
+        session,
+        "https://ensemble-api.open-meteo.com/v1/ensemble",
+        {
+            "latitude": latitudes,
+            "longitude": longitudes,
+            "models": ENSEMBLE_MODEL,
+            "hourly": (
+                "temperature_2m,"
+                "precipitation"
+            ),
+            "temperature_unit": "fahrenheit",
+            "precipitation_unit": "inch",
+            "timezone": "UTC",
+            "forecast_days": FORECAST_DAYS,
+        },
+    )
+
+    locations = (
+        parse_open_meteo_location_response(
+            payload,
+            names,
+        )
+    )
+
+    output = {}
+
+    for city_name, location_data in zip(
+        names,
+        locations,
+    ):
+        hourly = location_data.get(
+            "hourly",
+            {},
+        )
+
+        times = hourly.get(
+            "time",
+            [],
+        )
+
+        temp_keys = sorted(
+            key
+            for key in hourly
+            if key.startswith(
+                "temperature_2m_member"
+            )
+        )
+
+        rain_keys = sorted(
+            key
+            for key in hourly
+            if key.startswith(
+                "precipitation_member"
+            )
+        )
+
+        if not temp_keys:
+            raise RuntimeError(
+                f"{city_name}: no ensemble "
+                "temperature members returned."
+            )
+
+        if not rain_keys:
+            raise RuntimeError(
+                f"{city_name}: no ensemble "
+                "precipitation members returned."
+            )
+
+        local_tz = ZoneInfo(
+            CITIES[city_name][
+                "timezone"
+            ]
+        )
+
+        grouped = {}
+
+        for index, timestamp in enumerate(
+            times
+        ):
+            try:
+                dt = datetime.fromisoformat(
+                    str(timestamp).replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+            except ValueError:
+                continue
+
+            if dt.tzinfo is None:
+                dt = dt.replace(
+                    tzinfo=timezone.utc
+                )
+
+            forecast_date = (
+                dt.astimezone(
+                    local_tz
+                ).date().isoformat()
+            )
+
+            day = grouped.setdefault(
+                forecast_date,
+                {
+                    "temperature": {
+                        key: []
+                        for key in temp_keys
+                    },
+                    "rain": {
+                        key: 0.0
+                        for key in rain_keys
+                    },
+                },
+            )
+
+            for key in temp_keys:
+                values = hourly.get(
+                    key,
+                    [],
+                )
+
+                if index >= len(values):
+                    continue
+
+                value = safe_float(
+                    values[index]
+                )
+
+                if value is not None:
+                    day[
+                        "temperature"
+                    ][key].append(
+                        value
+                    )
+
+            for key in rain_keys:
+                values = hourly.get(
+                    key,
+                    [],
+                )
+
+                if index >= len(values):
+                    continue
+
+                value = safe_float(
+                    values[index]
+                )
+
+                if value is not None:
+                    day[
+                        "rain"
+                    ][key] += value
+
+        daily = {}
+
+        for forecast_date, day in grouped.items():
+            highs = []
+
+            for key in temp_keys:
+                values = day[
+                    "temperature"
+                ][key]
+
+                if values:
+                    highs.append(
+                        max(values)
+                    )
+
+            rains = [
+                day["rain"].get(
+                    key,
+                    0.0,
+                )
+                for key in rain_keys
+            ]
+
+            if highs and rains:
+                daily[
+                    forecast_date
+                ] = {
+                    "member_highs": highs,
+                    "member_rain_totals": rains,
+                }
+
+        model_run_time = (
+            location_data.get(
+                "model_run_time"
+            )
+            or location_data.get(
+                "model_run_id"
+            )
+        )
+
+        output[
+            city_name
+        ] = {
+            "daily": daily,
+            "model_run_time": (
+                str(model_run_time)
+                if model_run_time is not None
+                else None
+            ),
+            "temperature_member_count": len(
+                temp_keys
+            ),
+            "rain_member_count": len(
+                rain_keys
+            ),
+        }
+
+    return output
+
+
+def fetch_weather():
+    session = requests.Session()
+
+    deterministic = {}
+
+    with ThreadPoolExecutor(
+        max_workers=len(WEATHER_MODELS)
+    ) as executor:
+        jobs = {
+            executor.submit(
+                fetch_model,
+                session,
+                model,
+            ): model
+            for model in WEATHER_MODELS
+        }
+
+        for future in as_completed(
+            jobs
+        ):
+            model = jobs[
+                future
+            ]
+            deterministic[
+                model
+            ] = future.result()
+
+    ensemble = fetch_ensemble(
+        session
+    )
+
+    return deterministic, ensemble
 
 
 # ==========================================================
 # KALSHI
 # ==========================================================
 
-def get_series_list():
-    items = []
-    cursor = None
-    while True:
-        params = {
+def discover_temperature_series(
+    session,
+):
+    payload = request_json(
+        session,
+        f"{KALSHI_API_URL}/series",
+        {
             "category": "Climate and Weather",
-            "include_product_metadata": "true",
-        }
-        if cursor:
-            params["cursor"] = cursor
-        data = http_json(
-            f"{KALSHI_API_URL}/series",
-            params=params,
-        )
-        items.extend(data.get("series", []))
-        cursor = data.get("cursor")
-        if not cursor:
-            return items
+        },
+    )
 
+    output = []
 
-def save_series_registry(series_list):
-    for series in series_list:
-        db_execute(
-            """
-            INSERT INTO series_registry(
-                series_ticker,title,category,tags,settlement_sources,
-                contract_terms_url,updated_at,raw_series
-            ) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s)
-            ON CONFLICT(series_ticker) DO UPDATE SET
-                title=EXCLUDED.title,
-                category=EXCLUDED.category,
-                tags=EXCLUDED.tags,
-                settlement_sources=EXCLUDED.settlement_sources,
-                contract_terms_url=EXCLUDED.contract_terms_url,
-                updated_at=NOW(),
-                raw_series=EXCLUDED.raw_series
-            """,
-            (
-                series.get("ticker"),
-                series.get("title", ""),
-                series.get("category"),
-                Json(series.get("tags", [])),
-                Json(series.get("settlement_sources", [])),
-                series.get("contract_terms_url"),
-                Json(series),
-            ),
+    for item in payload.get(
+        "series",
+        [],
+    ):
+        title = (
+            item.get("title")
+            or ""
         )
 
+        frequency = (
+            item.get("frequency")
+            or ""
+        )
 
-def get_series_markets(series_ticker):
-    items = []
+        if (
+            "highest temperature"
+            not in title.lower()
+        ):
+            continue
+
+        if (
+            "daily"
+            not in frequency.lower()
+            and "daily temperature"
+            not in title.lower()
+        ):
+            continue
+
+        city_name = match_city_in_title(
+            title
+        )
+
+        ticker = item.get(
+            "ticker"
+        )
+
+        if (
+            city_name is None
+            or not ticker
+        ):
+            continue
+
+        output.append(
+            {
+                "ticker": ticker,
+                "city": city_name,
+                "metadata": item,
+            }
+        )
+
+    # One series per city is enough. If duplicates exist,
+    # prefer an exact city mapping and the first returned entry.
+    unique = {}
+
+    for item in output:
+        unique.setdefault(
+            item["city"],
+            item,
+        )
+
+    return list(
+        unique.values()
+    )
+
+
+def match_city_in_title(
+    title,
+):
+    lowered = title.lower()
+
+    ordered = sorted(
+        CITIES.items(),
+        key=lambda item: max(
+            len(alias)
+            for alias in item[1][
+                "aliases"
+            ]
+        ),
+        reverse=True,
+    )
+
+    for city_name, data in ordered:
+        for alias in data[
+            "aliases"
+        ]:
+            if alias in lowered:
+                return city_name
+
+    return None
+
+
+def fetch_markets_for_series(
+    session,
+    series_ticker,
+):
+    markets = []
     cursor = None
-    while True:
+
+    for _ in range(10):
         params = {
             "series_ticker": series_ticker,
             "status": "open",
             "limit": 1000,
         }
+
         if cursor:
             params["cursor"] = cursor
-        data = http_json(
+
+        payload = request_json(
+            session,
             f"{KALSHI_API_URL}/markets",
-            params=params,
+            params,
         )
-        items.extend(data.get("markets", []))
-        cursor = data.get("cursor")
+
+        page = payload.get(
+            "markets",
+            [],
+        )
+
+        markets.extend(
+            page
+        )
+
+        cursor = payload.get(
+            "cursor"
+        )
+
         if not cursor:
-            return items
+            break
+
+    return markets
 
 
-def get_series_metadata(ticker):
-    data = http_json(
-        f"{KALSHI_API_URL}/series/{ticker}"
+def parse_market_date(
+    ticker,
+):
+    parts = (
+        ticker or ""
+    ).split("-")
+
+    if len(parts) < 2:
+        return None
+
+    try:
+        return datetime.strptime(
+            parts[1],
+            "%y%b%d",
+        ).date().isoformat()
+    except ValueError:
+        return None
+
+
+def temperature_strike(
+    market,
+):
+    strike_type = (
+        market.get("strike_type")
+        or ""
+    ).lower()
+
+    floor = safe_float(
+        market.get("floor_strike")
     )
-    return data.get("series", {})
 
-
-def temperature_series(series):
-    title = (series.get("title") or "").lower()
-    tags = " ".join(str(x).lower() for x in series.get("tags", []))
-    return (
-        series.get("frequency") == "daily"
-        and "temperature" in (title + " " + tags)
-        and ("highest" in title or "high" in title or "maximum" in title)
+    cap = safe_float(
+        market.get("cap_strike")
     )
 
+    if strike_type == "between":
+        if floor is None or cap is None:
+            return None
 
-def is_rain_series(series):
-    ticker = (series.get("ticker") or "").upper()
-    title = (series.get("title") or "").lower()
-    return ticker == "KXRAIN" or (
-        series.get("frequency") == "daily"
-        and ("rain" in title or "precipitation" in title)
-    )
+        return (
+            "between",
+            floor,
+            cap,
+            f"{floor:g}°F to {cap:g}°F",
+        )
 
+    if strike_type == "greater":
+        if floor is None:
+            return None
 
-def location_from_title_or_ticker(series):
-    title = (series.get("title") or "").upper()
-    ticker = (series.get("ticker") or "").upper()
-    for code in LOCATION_MAP:
-        if re.search(rf"\b{re.escape(code)}\b", title):
-            return LOCATION_MAP[code]
-        if ticker.startswith("KXHIGH") and ticker[6:] == code:
-            return LOCATION_MAP[code]
-    # Common spelled-out names that don't use abbreviations in the title.
-    aliases = {
-        "NEW YORK": "NYC",
-        "NEW YORK CITY": "NYC",
-        "CHICAGO": "CHI",
-        "MIAMI": "MIA",
-        "AUSTIN": "AUS",
-        "LOS ANGELES": "LAX",
-        "DALLAS": "DAL",
-        "SEATTLE": "SEA",
-        "HOUSTON": "HOU",
-        "OKLAHOMA CITY": "OKC",
-        "PHILADELPHIA": "PHIL",
-        "PHOENIX": "PHX",
-        "SAN FRANCISCO": "SFO",
-        "LAS VEGAS": "LV",
-        "MINNEAPOLIS": "MIN",
-        "NEW ORLEANS": "NOLA",
-        "DENVER": "DEN",
-        "TRENTON": "TTN",
-        "NEWARK": "EWR",
-        "WASHINGTON DC": "DC",
-        "BOSTON": "BOS",
-        "ATLANTA": "ATL",
-        "SAN ANTONIO": "SATX",
-    }
-    for alias, code in aliases.items():
-        if alias in title:
-            return LOCATION_MAP[code]
+        return (
+            "greater",
+            floor,
+            None,
+            f">{floor:g}°F",
+        )
+
+    if strike_type == "less":
+        if cap is None:
+            return None
+
+        return (
+            "less",
+            None,
+            cap,
+            f"<{cap:g}°F",
+        )
+
     return None
 
 
-def rain_city_from_ticker(ticker):
-    suffix = (ticker or "").rsplit("-", 1)[-1].upper()
-    return LOCATION_MAP.get(suffix)
-
-
-# ==========================================================
-# HTTP / OPEN-METEO
-# ==========================================================
-
-def http_json(url, params=None):
-    response = requests.get(
-        url,
-        params=params,
-        headers={
-            "User-Agent": "WeatherKalshiResearchBot/4.0",
-            "Accept": "application/json",
-        },
-        timeout=REQUEST_TIMEOUT,
+def temperature_probability(
+    member_highs,
+    strike,
+):
+    values = list(
+        member_highs
     )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"HTTP {response.status_code}: {response.text[:500]}"
-        )
-    return response.json()
 
-
-def location_params(city_names):
-    return {
-        "latitude": ",".join(str(LOCATION_MAP[x][1]) for x in city_names),
-        "longitude": ",".join(str(LOCATION_MAP[x][2]) for x in city_names),
-    }
-
-
-def local_date(timestamp, timezone_name):
-    dt = datetime.fromisoformat(
-        str(timestamp).replace("Z", "+00:00")
-    )
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(
-        ZoneInfo(timezone_name)
-    ).date().isoformat()
-
-
-def aggregate_hourly(location_data, city_name):
-    hourly = location_data.get("hourly", {})
-    timestamps = hourly.get("time", [])
-    temps = hourly.get("temperature_2m", [])
-    precip = hourly.get("precipitation", [])
-    grouped = defaultdict(lambda: {"temps": [], "precip": []})
-    tz = LOCATION_MAP[city_name][3]
-    for i, ts in enumerate(timestamps):
-        date_key = local_date(ts, tz)
-        if i < len(temps):
-            value = safe_float(temps[i])
-            if value is not None:
-                grouped[date_key]["temps"].append(value)
-        if i < len(precip):
-            value = safe_float(precip[i])
-            if value is not None:
-                grouped[date_key]["precip"].append(value)
-    result = {}
-    for date_key, values in grouped.items():
-        if not values["temps"]:
-            continue
-        result[date_key] = {
-            "high": max(values["temps"]),
-            "precipitation_sum": sum(values["precip"]),
-        }
-    return result
-
-
-def fetch_deterministic_model(model, city_names):
-    params = location_params(city_names)
-    params.update({
-        "models": model,
-        "hourly": "temperature_2m,precipitation",
-        "temperature_unit": "fahrenheit",
-        "precipitation_unit": "inch",
-        "timezone": "UTC",
-        "forecast_days": FORECAST_DAYS,
-    })
-    url = (
-        "https://api.open-meteo.com/v1/gfs"
-        if model in {"hrrr", "nbm"}
-        else "https://api.open-meteo.com/v1/forecast"
-    )
-    data = http_json(url, params)
-    locations = data if isinstance(data, list) else [data]
-    if len(locations) != len(city_names):
-        raise RuntimeError(
-            f"{model}: expected {len(city_names)} locations, got {len(locations)}"
-        )
-    return {
-        city: {
-            "daily": aggregate_hourly(loc, city),
-            "model_run": (
-                loc.get("model_run")
-                or loc.get("model_run_id")
-                or loc.get("model_run_time")
-            ),
-        }
-        for city, loc in zip(city_names, locations)
-    }
-
-
-def fetch_ensemble(city_names):
-    params = location_params(city_names)
-    params.update({
-        "models": ENSEMBLE_MODEL,
-        "hourly": "temperature_2m,precipitation",
-        "temperature_unit": "fahrenheit",
-        "precipitation_unit": "inch",
-        "timezone": "UTC",
-        "forecast_days": FORECAST_DAYS,
-    })
-    data = http_json(
-        "https://ensemble-api.open-meteo.com/v1/ensemble",
-        params,
-    )
-    locations = data if isinstance(data, list) else [data]
-    if len(locations) != len(city_names):
-        raise RuntimeError(
-            f"ensemble: expected {len(city_names)} locations, got {len(locations)}"
-        )
-    output = {}
-    for city, loc in zip(city_names, locations):
-        hourly = loc.get("hourly", {})
-        timestamps = hourly.get("time", [])
-        temp_keys = sorted(
-            key for key in hourly
-            if key.startswith("temperature_2m_member")
-        )
-        precip_keys = sorted(
-            key for key in hourly
-            if key.startswith("precipitation_member")
-        )
-        if not temp_keys:
-            raise RuntimeError(
-                f"ensemble: no temperature member keys for {city}"
-            )
-        if not precip_keys:
-            raise RuntimeError(
-                f"ensemble: no precipitation member keys for {city}"
-            )
-        tz = LOCATION_MAP[city][3]
-        day = defaultdict(lambda: {
-            "temp": defaultdict(list),
-            "precip": defaultdict(float),
-        })
-        for i, ts in enumerate(timestamps):
-            date_key = local_date(ts, tz)
-            for key in temp_keys:
-                values = hourly.get(key, [])
-                if i < len(values):
-                    value = safe_float(values[i])
-                    if value is not None:
-                        day[date_key]["temp"][key].append(value)
-            for key in precip_keys:
-                values = hourly.get(key, [])
-                if i < len(values):
-                    value = safe_float(values[i])
-                    if value is not None:
-                        day[date_key]["precip"][key] += value
-        city_daily = {}
-        for date_key, values in day.items():
-            highs = [
-                max(v) for v in values["temp"].values()
-                if v
-            ]
-            rain = list(values["precip"].values())
-            if highs and rain:
-                city_daily[date_key] = {
-                    "member_highs": highs,
-                    "member_precip_totals": rain,
-                    "temperature_mean": statistics.mean(highs),
-                    "temperature_median": statistics.median(highs),
-                }
-        output[city] = {
-            "daily": city_daily,
-            "temperature_member_count": len(temp_keys),
-            "precipitation_member_count": len(precip_keys),
-        }
-    return output
-
-
-def save_weather_forecasts(deterministic, ensemble):
-    for model, cities in deterministic.items():
-        for city, data in cities.items():
-            for date_key, daily in data["daily"].items():
-                insert_forecast(
-                    city,
-                    "temperature_high",
-                    model,
-                    date_key,
-                    daily["high"],
-                    {
-                        **daily,
-                        "model_run": data.get("model_run"),
-                    },
-                )
-                insert_forecast(
-                    city,
-                    "precipitation_sum",
-                    model,
-                    date_key,
-                    daily["precipitation_sum"],
-                    {
-                        **daily,
-                        "model_run": data.get("model_run"),
-                    },
-                )
-    for city, data in ensemble.items():
-        for date_key, daily in data["daily"].items():
-            insert_forecast(
-                city,
-                "ensemble_temperature_distribution",
-                ENSEMBLE_MODEL,
-                date_key,
-                daily["temperature_mean"],
-                {"member_highs": daily["member_highs"]},
-            )
-            insert_forecast(
-                city,
-                "ensemble_rain_distribution",
-                ENSEMBLE_MODEL,
-                date_key,
-                statistics.mean(daily["member_precip_totals"]),
-                {"member_precip_totals": daily["member_precip_totals"]},
-            )
-
-
-# ==========================================================
-# PROBABILITIES / SIGNALS
-# ==========================================================
-
-def temperature_probability(member_highs, market):
-    if not member_highs:
+    if not values:
         return None
-    strike_type = (market.get("strike_type") or "").lower()
-    floor = safe_float(market.get("floor_strike"))
-    cap = safe_float(market.get("cap_strike"))
-    if strike_type == "greater" and floor is not None:
-        hits = sum(x > floor for x in member_highs)
-    elif strike_type == "less" and cap is not None:
-        hits = sum(x < cap for x in member_highs)
-    elif strike_type == "between" and floor is not None and cap is not None:
-        hits = sum(floor <= x <= cap for x in member_highs)
+
+    kind, floor, cap, _ = (
+        strike
+    )
+
+    if kind == "between":
+        matches = sum(
+            floor
+            <= value
+            <= cap
+            for value in values
+        )
+
+    elif kind == "greater":
+        matches = sum(
+            value > floor
+            for value in values
+        )
+
+    elif kind == "less":
+        matches = sum(
+            value < cap
+            for value in values
+        )
+
     else:
         return None
-    return 100.0 * hits / len(member_highs)
 
-
-def rain_probability(member_precip):
-    if not member_precip:
-        return None
-    return 100.0 * sum(value > 0.0 for value in member_precip) / len(member_precip)
-
-
-def get_side_ask_cents(market, side):
-    field = "yes_ask_dollars" if side == "YES" else "no_ask_dollars"
-    value = safe_float(market.get(field))
-    return None if value is None else value * 100.0
-
-
-def prior_member_data(city, date_key, variable):
-    row = latest_forecast(
-        city,
-        variable,
-        ENSEMBLE_MODEL,
-        date_key,
+    return (
+        matches
+        / len(values)
+        * 100.0
     )
-    if not row:
-        return None
-    return row[2] or {}
 
 
-def prior_hrrr_high(city, date_key):
-    row = latest_forecast(
-        city,
-        "temperature_high",
-        "hrrr",
-        date_key,
+def rain_probability(
+    member_rain_totals,
+):
+    values = list(
+        member_rain_totals
     )
-    return safe_float(row[1]) if row else None
+
+    if not values:
+        return None
+
+    matches = sum(
+        value > 0.0
+        for value in values
+    )
+
+    return (
+        matches
+        / len(values)
+        * 100.0
+    )
 
 
-def location_signal_allowed(entry):
-    return bool(entry[4]) or ALLOW_UNVERIFIED_LOCATION_SIGNALS
-
-
-def build_candidate(
-    city,
-    date_key,
+def market_ask(
     market,
+    side,
+):
+    field = (
+        "yes_ask_dollars"
+        if side == "YES"
+        else "no_ask_dollars"
+    )
+
+    value = safe_float(
+        market.get(field)
+    )
+
+    if value is None:
+        return None
+
+    return value * 100.0
+
+
+def previous_market_price(
+    previous_row,
+    side,
+):
+    if previous_row is None:
+        return None
+
+    index = (
+        2
+        if side == "YES"
+        else 4
+    )
+
+    return safe_float(
+        previous_row[index]
+    )
+
+
+def market_change_points(
+    current,
+    previous_row,
+    side,
+):
+    previous = previous_market_price(
+        previous_row,
+        side,
+    )
+
+    if previous is None:
+        return None
+
+    return (
+        current
+        - previous
+    )
+
+
+def candidate_is_strong(
+    candidate,
+):
+    if candidate is None:
+        return False
+
+    return (
+        abs(
+            candidate[
+                "forecast_change_points"
+            ]
+        )
+        >= MIN_FORECAST_PROBABILITY_CHANGE_POINTS
+        and candidate[
+            "market_lag_points"
+        ]
+        >= MIN_MARKET_LAG_POINTS
+        and candidate[
+            "preliminary_edge_points"
+        ]
+        >= MIN_PRELIMINARY_EDGE_POINTS
+        and MIN_ENTRY_PRICE_CENTS
+        <= candidate[
+            "entry_price_cents"
+        ]
+        <= MAX_ENTRY_PRICE_CENTS
+    )
+
+
+def make_candidate(
+    city_name,
+    forecast_date,
+    market,
+    side,
     current_probability,
     previous_probability,
-    hrrr_change_f,
-    kind,
+    market_change,
+    temp_change,
+    market_kind,
 ):
-    if current_probability is None or previous_probability is None:
+    ask = market_ask(
+        market,
+        side,
+    )
+
+    if ask is None:
         return None
 
-    probability_change = current_probability - previous_probability
-    if abs(probability_change) < MIN_FORECAST_PROBABILITY_CHANGE_POINTS:
+    if not (
+        MIN_ENTRY_PRICE_CENTS
+        <= ask
+        <= MAX_ENTRY_PRICE_CENTS
+    ):
         return None
 
-    ticker = market.get("ticker") or ""
-    previous_market = latest_market(ticker)
-    if not previous_market:
-        return None
+    probability_change = (
+        current_probability
+        - previous_probability
+    )
 
-    best = None
-    for side in ("YES", "NO"):
-        ask = get_side_ask_cents(market, side)
-        if ask is None or not (MIN_ENTRY_PRICE_CENTS <= ask <= MAX_ENTRY_PRICE_CENTS):
-            continue
+    same_direction = (
+        probability_change
+        * market_change
+        > 0
+    )
 
-        side_probability = current_probability if side == "YES" else 100.0 - current_probability
-        side_probability_change = probability_change if side == "YES" else -probability_change
-        previous_ask = safe_float(
-            previous_market[2] if side == "YES" else previous_market[4]
+    if same_direction:
+        lag = (
+            abs(probability_change)
+            - abs(market_change)
         )
-        if previous_ask is None:
-            continue
+    else:
+        # A flat or counter-moving market does not reduce
+        # the forecast shock; it is treated as full lag.
+        lag = abs(
+            probability_change
+        )
 
-        market_change = ask - previous_ask
-        market_lag = side_probability_change - market_change
-        preliminary_edge = side_probability - ask
-
-        if market_lag < MIN_MARKET_LAG_POINTS:
-            continue
-        if preliminary_edge < MIN_PRELIMINARY_EDGE_POINTS:
-            continue
-
-        candidate = {
-            "city": city,
-            "forecast_date": date_key,
-            "market_ticker": ticker,
-            "market_kind": kind,
-            "side": side,
-            "entry_price_cents": ask,
-            "model_probability_proxy": side_probability,
-            "preliminary_edge_points": preliminary_edge,
-            "forecast_probability_change_points": side_probability_change,
-            "market_price_change_points": market_change,
-            "market_lag_points": market_lag,
-            "forecast_temperature_change_f": hrrr_change_f,
-            "contract_label": market.get("title") or "",
-        }
-        if best is None or (
-            candidate["market_lag_points"],
-            candidate["preliminary_edge_points"],
-        ) > (
-            best["market_lag_points"],
-            best["preliminary_edge_points"],
-        ):
-            best = candidate
-
-    return best
+    return {
+        "city": city_name,
+        "forecast_date": forecast_date,
+        "ticker": market[
+            "ticker"
+        ],
+        "market_kind": market_kind,
+        "side": side,
+        "entry_price_cents": ask,
+        "model_probability_proxy": (
+            current_probability
+        ),
+        "forecast_change_points": (
+            probability_change
+        ),
+        "market_change_points": (
+            market_change
+        ),
+        "market_lag_points": lag,
+        "preliminary_edge_points": (
+            current_probability
+            - ask
+        ),
+        "forecast_temperature_change_f": (
+            temp_change
+        ),
+    }
 
 
-def signal_fingerprint(signal):
-    raw = "|".join([
-        signal["market_ticker"],
-        signal["side"],
-        signal["forecast_date"],
-        f"{signal['entry_price_cents']:.2f}",
-        f"{signal['model_probability_proxy']:.2f}",
-        f"{signal['forecast_probability_change_points']:.2f}",
-        f"{signal['market_price_change_points']:.2f}",
-    ])
-    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+# ==========================================================
+# PAPER TRADING
+# ==========================================================
 
-
-def alert_exists(fp):
-    return db_execute(
-        "SELECT 1 FROM alert_log WHERE fingerprint=%s",
-        (fp,),
-        fetchone=True,
-    ) is not None
-
-
-def paper_trade_exists(fp):
-    return db_execute(
-        "SELECT 1 FROM paper_trades WHERE signal_fingerprint=%s",
-        (fp,),
-        fetchone=True,
-    ) is not None
-
-
-def open_paper_trade(signal, reason):
-    fp = signal_fingerprint(signal)
-    if paper_trade_exists(fp):
-        return fp
-
-    entry = signal["entry_price_cents"] / 100.0
-    if entry <= 0:
-        return fp
-
-    contracts = PAPER_RISK_DOLLARS / entry
-    db_execute(
-        """
-        INSERT INTO paper_trades(
-            signal_fingerprint,created_at,city,forecast_date,market_ticker,
-            market_kind,side,entry_price_cents,stake_dollars,contracts,
-            model_probability_proxy,preliminary_edge_points,
-            forecast_probability_change_points,market_price_change_points,
-            market_lag_points,forecast_temperature_change_f,reason,status
-        ) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
-        ON CONFLICT(signal_fingerprint) DO NOTHING
-        """,
-        (
-            fp,
+def signal_fingerprint(
+    signal,
+):
+    raw = "|".join(
+        [
+            signal["ticker"],
+            signal["side"],
             signal["city"],
             signal["forecast_date"],
-            signal["market_ticker"],
-            signal["market_kind"],
-            signal["side"],
-            signal["entry_price_cents"],
-            PAPER_RISK_DOLLARS,
-            contracts,
-            signal["model_probability_proxy"],
-            signal["preliminary_edge_points"],
-            signal["forecast_probability_change_points"],
-            signal["market_price_change_points"],
-            signal["market_lag_points"],
-            signal.get("forecast_temperature_change_f"),
-            Json(reason),
-        ),
+            f"{signal['entry_price_cents']:.2f}",
+            f"{signal['model_probability_proxy']:.2f}",
+            f"{signal['forecast_change_points']:.2f}",
+        ]
     )
-    return fp
+
+    return hashlib.sha256(
+        raw.encode(
+            "utf-8"
+        )
+    ).hexdigest()[:32]
 
 
-def send_discord(message):
-    if not DISCORD_RELAY_URL or not DISCORD_RELAY_SECRET:
-        log.error("Discord relay is not configured.")
+def open_paper_trade(
+    signal,
+    reason,
+):
+    fp = signal_fingerprint(
+        signal
+    )
+
+    price = (
+        signal["entry_price_cents"]
+        / 100.0
+    )
+
+    if price <= 0:
+        return False, fp
+
+    contracts = (
+        PAPER_RISK_DOLLARS
+        / price
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO paper_trades(
+                    signal_fingerprint,
+                    city,
+                    forecast_date,
+                    ticker,
+                    market_kind,
+                    side,
+                    entry_price_cents,
+                    risk_dollars,
+                    contracts,
+                    model_probability_proxy,
+                    preliminary_edge_points,
+                    forecast_change_points,
+                    market_change_points,
+                    market_lag_points,
+                    forecast_temperature_change_f,
+                    reason,
+                    status
+                )
+                VALUES(
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,'open'
+                )
+                ON CONFLICT(
+                    signal_fingerprint
+                )
+                DO NOTHING
+                """,
+                (
+                    fp,
+                    signal["city"],
+                    signal["forecast_date"],
+                    signal["ticker"],
+                    signal["market_kind"],
+                    signal["side"],
+                    signal[
+                        "entry_price_cents"
+                    ],
+                    PAPER_RISK_DOLLARS,
+                    contracts,
+                    signal[
+                        "model_probability_proxy"
+                    ],
+                    signal[
+                        "preliminary_edge_points"
+                    ],
+                    signal[
+                        "forecast_change_points"
+                    ],
+                    signal[
+                        "market_change_points"
+                    ],
+                    signal[
+                        "market_lag_points"
+                    ],
+                    signal.get(
+                        "forecast_temperature_change_f"
+                    ),
+                    Json(reason),
+                ),
+            )
+
+            created = (
+                cur.rowcount == 1
+            )
+
+    return created, fp
+
+
+def send_discord(
+    message,
+):
+    if (
+        not DISCORD_RELAY_URL
+        or not DISCORD_RELAY_SECRET
+    ):
+        logger.warning(
+            "Discord relay is not configured."
+        )
         return False
+
     try:
         response = requests.post(
             DISCORD_RELAY_URL,
@@ -957,544 +1874,1308 @@ def send_discord(message):
                 "message": message,
             },
             headers={
-                "User-Agent": "WeatherKalshiResearchBot/4.0",
+                "Content-Type": "application/json",
                 "Accept": "application/json",
             },
             timeout=REQUEST_TIMEOUT,
         )
-        log.info("Discord relay response: %s", response.status_code)
-        if not (200 <= response.status_code < 300):
-            log.error("Discord relay error: %s", response.text[:1000])
+
+        if not (
+            200
+            <= response.status_code
+            < 300
+        ):
+            logger.error(
+                "Discord relay failed: "
+                "%s %s",
+                response.status_code,
+                response.text[:500],
+            )
             return False
+
         try:
             payload = response.json()
         except Exception:
             payload = {}
-        if payload.get("success") is False:
-            log.error("Discord relay reported failure: %s", payload)
+
+        if payload.get(
+            "success"
+        ) is False:
+            logger.error(
+                "Discord relay reported failure: %s",
+                payload,
+            )
             return False
+
         return True
-    except Exception as exc:
-        log.error("Discord relay exception: %s", exc)
+
+    except Exception as error:
+        logger.error(
+            "Discord relay exception: %s",
+            error,
+        )
         return False
 
 
-def signal_message(signal):
-    temp_line = ""
-    temp = signal.get("forecast_temperature_change_f")
-    if temp is not None:
-        temp_line = f"HRRR high change: **{temp:+.1f}°F**\n"
-    return (
-        "🌦️ **WEATHER FORECAST SHOCK — PAPER TRADE**\n\n"
-        f"**{signal['city']} — {signal['forecast_date']}**\n"
-        f"Market: `{signal['market_ticker']}`\n"
+def send_signal_alert(
+    signal,
+    fp,
+):
+    direction = (
+        "up"
+        if signal[
+            "forecast_change_points"
+        ] > 0
+        else "down"
+    )
+
+    message = (
+        "🌦️ **WEATHER FORECAST SHOCK — "
+        "PAPER TRADE**\n\n"
+        f"**{signal['city']} — "
+        f"{signal['forecast_date']}**\n"
+        f"Market: `{signal['ticker']}`\n"
+        f"Type: **{signal['market_kind']}**\n"
         f"Side: **{signal['side']}**\n"
-        f"Entry ask: **{signal['entry_price_cents']:.1f}¢**\n\n"
-        f"Model probability proxy: **{signal['model_probability_proxy']:.1f}%**\n"
-        f"Forecast probability change: **{signal['forecast_probability_change_points']:+.1f} pts**\n"
-        f"Market ask change: **{signal['market_price_change_points']:+.1f} pts**\n"
-        f"Estimated market lag: **{signal['market_lag_points']:+.1f} pts**\n"
-        f"Preliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n"
-        f"{temp_line}\n"
-        f"Paper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n"
-        "⚠️ Research only. Model probability is an uncalibrated ensemble-frequency proxy; "
-        "settlement source/location still requires validation."
+        f"Entry ask: **"
+        f"{signal['entry_price_cents']:.1f}¢**\n\n"
+        f"Raw ensemble probability proxy: "
+        f"**{signal['model_probability_proxy']:.1f}%**\n"
+        f"Forecast probability change: "
+        f"**{direction} "
+        f"{abs(signal['forecast_change_points']):.1f} pts**\n"
+        f"Market price change: "
+        f"**{signal['market_change_points']:+.1f} pts**\n"
+        f"Estimated market lag: "
+        f"**{signal['market_lag_points']:.1f} pts**\n"
+        f"Preliminary edge: "
+        f"**{signal['preliminary_edge_points']:+.1f} pts**\n"
     )
 
+    if (
+        signal.get(
+            "forecast_temperature_change_f"
+        )
+        is not None
+    ):
+        message += (
+            f"HRRR high change: "
+            f"**{signal['forecast_temperature_change_f']:+.1f}°F**\n"
+        )
 
-def record_alert(fp, signal):
-    db_execute(
-        """
-        INSERT INTO alert_log(fingerprint,sent_at,payload)
-        VALUES(%s,NOW(),%s)
-        ON CONFLICT(fingerprint) DO NOTHING
-        """,
-        (fp, Json(signal)),
+    message += (
+        f"\nPaper risk: "
+        f"**${PAPER_RISK_DOLLARS:.2f}**\n"
+        f"Signal fingerprint: `{fp}`\n\n"
+        "⚠️ **Paper trading only.** "
+        "The probability is an uncalibrated "
+        "ensemble-frequency proxy, not a proven "
+        "fair probability."
     )
 
+    return send_discord(
+        message
+    )
 
-# ==========================================================
-# PAPER SETTLEMENT
-# ==========================================================
 
 def settle_paper_trades():
-    rows = db_execute(
-        """
-        SELECT id,market_ticker,side,stake_dollars,contracts
-        FROM paper_trades
-        WHERE status='open'
-        ORDER BY created_at ASC
-        LIMIT 200
-        """,
-        fetch=True,
-    )
-    for trade_id, ticker, side, stake, contracts in rows:
-        try:
-            data = http_json(
-                f"{KALSHI_API_URL}/markets/{ticker}"
-            )
-            market = data.get("market", {})
-            result = (market.get("result") or "").lower()
-            if result not in {"yes", "no"}:
-                continue
-            won = result == side.lower()
-            pnl = contracts - stake if won else -stake
-            db_execute(
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
                 """
-                UPDATE paper_trades
-                SET settled_at=NOW(),result=%s,profit_loss_dollars=%s,status='settled'
-                WHERE id=%s
-                """,
-                (result, pnl, trade_id),
+                SELECT
+                    id,
+                    ticker,
+                    side,
+                    risk_dollars,
+                    contracts
+                FROM paper_trades
+                WHERE status='open'
+                ORDER BY created_at
+                LIMIT 500
+                """
             )
-            log.info(
-                "PAPER TRADE SETTLED | %s | %s | %s | P/L=$%.2f",
+
+            rows = cur.fetchall()
+
+        if not rows:
+            return
+
+        tickers = sorted(
+            {
+                row[1]
+                for row in rows
+            }
+        )
+
+        session = requests.Session()
+
+        payload = request_json(
+            session,
+            f"{KALSHI_API_URL}/markets",
+            {
+                "tickers": ",".join(
+                    tickers
+                ),
+                "limit": 1000,
+            },
+        )
+
+        markets = {
+            market.get("ticker"): market
+            for market in payload.get(
+                "markets",
+                [],
+            )
+        }
+
+        for (
+            trade_id,
+            ticker,
+            side,
+            risk_dollars,
+            contracts,
+        ) in rows:
+            market = markets.get(
+                ticker
+            )
+
+            if not market:
+                continue
+
+            result = (
+                market.get("result")
+                or ""
+            ).lower()
+
+            if result not in {
+                "yes",
+                "no",
+            }:
+                continue
+
+            won = (
+                result == side.lower()
+            )
+
+            if won:
+                pnl = (
+                    float(contracts)
+                    - float(risk_dollars)
+                )
+            else:
+                pnl = -float(
+                    risk_dollars
+                )
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE paper_trades
+                    SET settled_at=NOW(),
+                        result=%s,
+                        profit_loss_dollars=%s,
+                        status='settled'
+                    WHERE id=%s
+                      AND status='open'
+                    """,
+                    (
+                        result,
+                        pnl,
+                        trade_id,
+                    ),
+                )
+
+            logger.info(
+                "PAPER TRADE SETTLED | "
+                "%s | %s | result=%s | P/L=$%.2f",
                 ticker,
                 side,
                 result,
                 pnl,
             )
-        except Exception as exc:
-            log.warning(
-                "Could not settle %s: %s",
-                ticker,
-                exc,
-            )
 
 
 # ==========================================================
-# SCANNER
+# SCAN
 # ==========================================================
 
-def start_scan_run():
-    row = db_execute(
-        """
-        INSERT INTO scan_runs(started_at,status,stats)
-        VALUES(NOW(),'running','{}'::jsonb)
-        RETURNING id
-        """,
-        fetchone=True,
-    )
-    return row[0]
+def scan():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is missing."
+        )
 
+    ensure_schema()
 
-def finish_scan_run(scan_id, status, stats, error=None):
-    db_execute(
-        """
-        UPDATE scan_runs
-        SET completed_at=NOW(),status=%s,stats=%s,error=%s
-        WHERE id=%s
-        """,
-        (
-            status,
-            Json(stats),
-            error,
-            scan_id,
-        ),
-    )
-
-
-def run_scan():
-    scan_id = None
-    stats = {
-        "temperature_series": 0,
-        "temperature_markets": 0,
-        "rain_series": 0,
-        "rain_markets": 0,
-        "weather_refreshed": False,
-        "forecast_shocks": 0,
-        "paper_trades_created": 0,
-        "discord_alerts": 0,
-        "settled_trades": 0,
-    }
-    started = time.time()
+    run_id = begin_run()
+    started = time.monotonic()
 
     try:
-        ensure_schema()
-        scan_id = start_scan_run()
-        settle_paper_trades()
-
-        all_series = get_series_list()
-        save_series_registry(all_series)
-        temp_series = [s for s in all_series if temperature_series(s)]
-        rain_series_list = [s for s in all_series if is_rain_series(s)]
-        stats["temperature_series"] = len(temp_series)
-        stats["rain_series"] = len(rain_series_list)
-
-        # Build the union of all city proxies needed by both the discovered
-        # daily temperature series and the current KXRAIN multi-city event.
-        # Rain-only cities therefore receive weather forecasts too.
-        city_locations = {}
-        for series in temp_series:
-            location = location_from_title_or_ticker(series)
-            if location is not None:
-                city_locations[location[0]] = location
-
-        try:
-            rain_markets_for_city_discovery = get_series_markets("KXRAIN")
-        except Exception as exc:
-            rain_markets_for_city_discovery = []
-            log.warning(
-                "KXRAIN city discovery failed: %s",
-                exc,
-            )
-
-        for market in rain_markets_for_city_discovery:
-            location = rain_city_from_ticker(
-                market.get("ticker")
-            )
-            if location is not None:
-                city_locations[location[0]] = location
-
-        if not city_locations:
-            raise RuntimeError(
-                "No current Kalshi weather markets could be mapped to forecast coordinates."
-            )
-
-        city_names = sorted(city_locations)
-
-        last_weather = get_latest_weather_fetch_time()
-        refresh_weather = (
-            last_weather is None
-            or (utc_now() - last_weather).total_seconds() >= WEATHER_REFRESH_SECONDS
+        logger.info(
+            "=================================================="
+        )
+        logger.info(
+            "STARTING WEATHER MARKET SCAN"
+        )
+        logger.info(
+            "UTC: %s",
+            utc_now().isoformat(),
+        )
+        logger.info(
+            "=================================================="
         )
 
-        deterministic = {}
-        ensemble = {}
+        session = requests.Session()
 
-        if refresh_weather:
-            stats["weather_refreshed"] = True
-            for model in (
-                "hrrr",
-                "nbm",
-                "gfs_seamless",
-                "ecmwf_ifs025",
+        deterministic, ensemble = (
+            fetch_weather()
+        )
+
+        series = (
+            discover_temperature_series(
+                session
+            )
+        )
+
+        temperature_results = []
+
+        with ThreadPoolExecutor(
+            max_workers=SCAN_WORKERS
+        ) as executor:
+            futures = {
+                executor.submit(
+                    fetch_markets_for_series,
+                    session,
+                    item["ticker"],
+                ): item
+                for item in series
+            }
+
+            for future in as_completed(
+                futures
             ):
-                deterministic[model] = fetch_deterministic_model(
-                    model,
-                    city_names,
-                )
-                log.info(
-                    "Weather model fetched: %s",
-                    model,
-                )
-            ensemble = fetch_ensemble(city_names)
+                item = futures[
+                    future
+                ]
 
-            # IMPORTANT: signals are calculated against the previous database
-            # observations BEFORE this fresh forecast is inserted.
-            process_temperature_signals(
-                temp_series,
-                deterministic,
-                ensemble,
-                stats,
-            )
-            process_rain_signals(
-                rain_series_list,
-                ensemble,
-                stats,
-            )
-
-            # Only after signal comparison is complete do we write the new
-            # forecast observations as the latest baseline.
-            save_weather_forecasts(
-                deterministic,
-                ensemble,
-            )
-
-        # Market snapshots are collected every five-minute cron run,
-        # regardless of whether a new weather forecast was fetched.
-        collect_market_snapshots(
-            temp_series,
-            rain_series_list,
-            stats,
-        )
-
-        settle_paper_trades()
-        finish_scan_run(
-            scan_id,
-            "success",
-            stats,
-            None,
-        )
-        log.info(
-            "SCAN COMPLETE | %s | runtime=%.1fs",
-            json.dumps(stats, default=str),
-            time.time() - started,
-        )
-
-    except Exception as exc:
-        log.exception("SCAN FAILED")
-        if scan_id is not None:
-            try:
-                finish_scan_run(
-                    scan_id,
-                    "failed",
-                    stats,
-                    str(exc),
-                )
-            except Exception:
-                log.exception("Could not record scan failure")
-        raise
-
-
-def process_temperature_signals(temp_series, deterministic, ensemble, stats):
-    for series in temp_series:
-        location = location_from_title_or_ticker(series)
-        if location is None:
-            log.warning(
-                "Unmapped temperature series: %s | %s",
-                series.get("ticker"),
-                series.get("title"),
-            )
-            continue
-
-        city, _, _, tz, verified = location
-        if not location_signal_allowed(location):
-            log.info(
-                "Monitoring %s, but paper signals are blocked because settlement location is unverified.",
-                city,
-            )
+                try:
+                    temperature_results.append(
+                        (
+                            item,
+                            future.result(),
+                        )
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Temperature market fetch failed "
+                        "for %s: %s",
+                        item["ticker"],
+                        error,
+                    )
 
         try:
-            markets = get_series_markets(
-                series["ticker"]
+            rain_markets = (
+                fetch_markets_for_series(
+                    session,
+                    "KXRAIN",
+                )
             )
-        except Exception as exc:
-            log.error(
-                "Could not fetch %s: %s",
-                series.get("ticker"),
-                exc,
+        except Exception as error:
+            logger.error(
+                "KXRAIN fetch failed: %s",
+                error,
             )
-            continue
+            rain_markets = []
 
-        stats["temperature_markets"] += len(markets)
-        city_ensemble = (
-            ensemble.get(city, {}).get("daily", {})
+        # ------------------------------------------------------
+        # Build all market rows first.
+        # ------------------------------------------------------
+
+        market_entries = []
+
+        for series_info, markets in (
+            temperature_results
+        ):
+            for market in markets:
+                ticker = (
+                    market.get("ticker")
+                    or ""
+                )
+
+                city_name = series_info[
+                    "city"
+                ]
+
+                market_date = parse_market_date(
+                    ticker
+                )
+
+                if market_date is None:
+                    continue
+
+                if market_date < today_for_city(
+                    CITIES[city_name]
+                ):
+                    continue
+
+                market_entries.append(
+                    {
+                        "market": market,
+                        "city": city_name,
+                        "date": market_date,
+                        "kind": "temperature",
+                        "series_info": series_info,
+                    }
+                )
+
+        for market in rain_markets:
+            ticker = (
+                market.get("ticker")
+                or ""
+            )
+
+            city_name = rain_city_from_ticker(
+                ticker
+            )
+
+            if city_name is None:
+                continue
+
+            market_date = parse_market_date(
+                ticker
+            )
+
+            if market_date is None:
+                continue
+
+            if market_date < today_for_city(
+                CITIES[city_name]
+            ):
+                continue
+
+            market_entries.append(
+                {
+                    "market": market,
+                    "city": city_name,
+                    "date": market_date,
+                    "kind": "rain",
+                    "series_info": {
+                        "ticker": "KXRAIN",
+                        "metadata": {},
+                    },
+                }
+            )
+
+        tickers = sorted(
+            {
+                entry["market"].get(
+                    "ticker"
+                )
+                for entry in market_entries
+                if entry["market"].get(
+                    "ticker"
+                )
+            }
         )
 
-        for market in markets:
-            date_key = parse_market_date(market)
-            if not date_key:
-                continue
-            today = datetime.now(
-                ZoneInfo(tz)
-            ).date().isoformat()
-            if date_key < today:
-                continue
+        # ------------------------------------------------------
+        # Read previous history BEFORE writing current history.
+        # This ordering is intentional.
+        # ------------------------------------------------------
 
-            current_daily = city_ensemble.get(date_key)
-            if not current_daily:
-                continue
+        forecast_keys = set()
 
-            previous = prior_member_data(
-                city,
-                date_key,
-                "ensemble_temperature_distribution",
-            )
-            if not previous:
-                continue
-
-            old_members = previous.get(
-                "member_highs",
-                [],
-            )
-            current_members = current_daily[
-                "member_highs"
+        for entry in market_entries:
+            city_name = entry[
+                "city"
             ]
-            current_prob = temperature_probability(
-                current_members,
-                market,
-            )
-            previous_prob = temperature_probability(
-                old_members,
-                market,
+            market_date = entry[
+                "date"
+            ]
+
+            forecast_keys.add(
+                (
+                    city_name,
+                    "ensemble",
+                    (
+                        "temperature_distribution"
+                        if entry["kind"]
+                        == "temperature"
+                        else "rain_distribution"
+                    ),
+                    market_date,
+                )
             )
 
-            hrrr_old = prior_hrrr_high(
-                city,
-                date_key,
+            if entry["kind"] == "temperature":
+                forecast_keys.add(
+                    (
+                        city_name,
+                        "hrrr",
+                        "temperature_high",
+                        market_date,
+                    )
+                )
+
+        with db_connect() as conn:
+            previous_forecasts = (
+                read_previous_forecasts(
+                    conn,
+                    sorted(
+                        forecast_keys
+                    ),
+                )
             )
-            hrrr_current = (
-                deterministic.get("hrrr", {})
-                .get(city, {})
+
+            previous_markets = (
+                read_previous_markets(
+                    conn,
+                    tickers,
+                )
+            )
+
+        candidates = []
+
+        # ------------------------------------------------------
+        # Temperature signals.
+        # ------------------------------------------------------
+
+        for entry in market_entries:
+            if entry["kind"] != "temperature":
+                continue
+
+            market = entry[
+                "market"
+            ]
+
+            city_name = entry[
+                "city"
+            ]
+
+            forecast_date = entry[
+                "date"
+            ]
+
+            if not (
+                CITIES[city_name][
+                    "signal_eligible"
+                ]
+                or ALLOW_UNVERIFIED_SIGNALS
+            ):
+                continue
+
+            ensemble_day = (
+                ensemble
+                .get(city_name, {})
                 .get("daily", {})
-                .get(date_key, {})
-                .get("high")
-            )
-            hrrr_change = (
-                hrrr_current - hrrr_old
-                if hrrr_current is not None and hrrr_old is not None
-                else None
+                .get(forecast_date)
             )
 
-            if location_signal_allowed(location):
-                signal = build_candidate(
-                    city,
-                    date_key,
+            if not ensemble_day:
+                continue
+
+            current_members = (
+                ensemble_day[
+                    "member_highs"
+                ]
+            )
+
+            prev_row = (
+                previous_forecasts.get(
+                    (
+                        city_name,
+                        "ensemble",
+                        "temperature_distribution",
+                        forecast_date,
+                    )
+                )
+            )
+
+            if prev_row is None:
+                continue
+
+            previous_members = (
+                (prev_row[4] or {})
+                .get(
+                    "member_highs",
+                    [],
+                )
+            )
+
+            if not previous_members:
+                continue
+
+            strike = temperature_strike(
+                market
+            )
+
+            if strike is None:
+                continue
+
+            current_yes = (
+                temperature_probability(
+                    current_members,
+                    strike,
+                )
+            )
+
+            previous_yes = (
+                temperature_probability(
+                    previous_members,
+                    strike,
+                )
+            )
+
+            if (
+                current_yes is None
+                or previous_yes is None
+            ):
+                continue
+
+            hrrr_prev = previous_forecasts.get(
+                (
+                    city_name,
+                    "hrrr",
+                    "temperature_high",
+                    forecast_date,
+                )
+            )
+
+            current_hrrr = (
+                deterministic
+                .get("hrrr", {})
+                .get(city_name, {})
+                .get("daily", {})
+                .get(forecast_date)
+            )
+
+            hrrr_change = None
+
+            if (
+                hrrr_prev is not None
+                and current_hrrr is not None
+            ):
+                old_high = safe_float(
+                    hrrr_prev[1]
+                )
+
+                if old_high is not None:
+                    hrrr_change = (
+                        current_hrrr["high"]
+                        - old_high
+                    )
+
+            previous_market = (
+                previous_markets.get(
+                    market.get("ticker")
+                )
+            )
+
+            if previous_market is None:
+                continue
+
+            for side in (
+                "YES",
+                "NO",
+            ):
+                ask = market_ask(
                     market,
-                    current_prob,
-                    previous_prob,
+                    side,
+                )
+
+                if ask is None:
+                    continue
+
+                current_probability = (
+                    current_yes
+                    if side == "YES"
+                    else 100.0
+                    - current_yes
+                )
+
+                previous_probability = (
+                    previous_yes
+                    if side == "YES"
+                    else 100.0
+                    - previous_yes
+                )
+
+                mchange = (
+                    market_change_points(
+                        ask,
+                        previous_market,
+                        side,
+                    )
+                )
+
+                if mchange is None:
+                    continue
+
+                candidate = make_candidate(
+                    city_name,
+                    forecast_date,
+                    market,
+                    side,
+                    current_probability,
+                    previous_probability,
+                    mchange,
                     hrrr_change,
                     "temperature",
                 )
-                if signal:
-                    stats["forecast_shocks"] += 1
-                    emit_signal(signal, series, stats)
 
+                if candidate_is_strong(
+                    candidate
+                ):
+                    candidates.append(
+                        candidate
+                    )
 
-def process_rain_signals(rain_series_list, ensemble, stats):
-    for series in rain_series_list:
-        ticker = (series.get("ticker") or "").upper()
-        if ticker != "KXRAIN":
-            continue
+        # ------------------------------------------------------
+        # Rain signals.
+        # ------------------------------------------------------
 
-        markets = get_series_markets("KXRAIN")
-        for market in markets:
-            location = rain_city_from_ticker(
-                market.get("ticker")
-            )
-            if not location:
+        for entry in market_entries:
+            if entry["kind"] != "rain":
                 continue
 
-            city, _, _, tz, _ = location
-            if not ALLOW_UNVERIFIED_LOCATION_SIGNALS:
+            city_name = entry[
+                "city"
+            ]
+
+            forecast_date = entry[
+                "date"
+            ]
+
+            if not (
+                CITIES[city_name][
+                    "signal_eligible"
+                ]
+                or ALLOW_UNVERIFIED_SIGNALS
+            ):
                 continue
 
-            date_key = parse_market_date(market)
-            if not date_key:
-                continue
-            today = datetime.now(
-                ZoneInfo(tz)
-            ).date().isoformat()
-            if date_key < today:
-                continue
+            market = entry[
+                "market"
+            ]
 
-            current_daily = (
-                ensemble.get(city, {})
+            ensemble_day = (
+                ensemble
+                .get(city_name, {})
                 .get("daily", {})
-                .get(date_key)
+                .get(forecast_date)
             )
-            if not current_daily:
+
+            if not ensemble_day:
                 continue
 
-            previous = prior_member_data(
-                city,
-                date_key,
-                "ensemble_rain_distribution",
+            current_members = (
+                ensemble_day[
+                    "member_rain_totals"
+                ]
             )
-            if not previous:
+
+            prev_row = (
+                previous_forecasts.get(
+                    (
+                        city_name,
+                        "ensemble",
+                        "rain_distribution",
+                        forecast_date,
+                    )
+                )
+            )
+
+            if prev_row is None:
                 continue
 
-            current_prob = rain_probability(
-                current_daily["member_precip_totals"]
-            )
-            previous_prob = rain_probability(
-                previous.get("member_precip_totals", [])
+            previous_members = (
+                (prev_row[4] or {})
+                .get(
+                    "member_rain_totals",
+                    [],
+                )
             )
 
-            signal = build_candidate(
-                city,
-                date_key,
-                market,
-                current_prob,
-                previous_prob,
-                None,
-                "rain",
+            current_yes = (
+                rain_probability(
+                    current_members
+                )
             )
-            if signal:
-                stats["forecast_shocks"] += 1
-                emit_signal(
-                    signal,
-                    series,
-                    stats,
+
+            previous_yes = (
+                rain_probability(
+                    previous_members
+                )
+            )
+
+            if (
+                current_yes is None
+                or previous_yes is None
+            ):
+                continue
+
+            previous_market = (
+                previous_markets.get(
+                    market.get("ticker")
+                )
+            )
+
+            if previous_market is None:
+                continue
+
+            for side in (
+                "YES",
+                "NO",
+            ):
+                ask = market_ask(
+                    market,
+                    side,
                 )
 
+                if ask is None:
+                    continue
 
-def collect_market_snapshots(temp_series, rain_series_list, stats):
-    for series in temp_series:
-        location = location_from_title_or_ticker(series)
-        city = location[0] if location else None
-        try:
-            markets = get_series_markets(series["ticker"])
-        except Exception as exc:
-            log.warning(
-                "Market snapshot fetch failed for %s: %s",
-                series.get("ticker"),
-                exc,
-            )
-            continue
-        for market in markets:
-            insert_market_snapshot(
-                market,
-                city,
-                "temperature",
+                current_probability = (
+                    current_yes
+                    if side == "YES"
+                    else 100.0
+                    - current_yes
+                )
+
+                previous_probability = (
+                    previous_yes
+                    if side == "YES"
+                    else 100.0
+                    - previous_yes
+                )
+
+                mchange = (
+                    market_change_points(
+                        ask,
+                        previous_market,
+                        side,
+                    )
+                )
+
+                if mchange is None:
+                    continue
+
+                candidate = make_candidate(
+                    city_name,
+                    forecast_date,
+                    market,
+                    side,
+                    current_probability,
+                    previous_probability,
+                    mchange,
+                    None,
+                    "rain",
+                )
+
+                if candidate_is_strong(
+                    candidate
+                ):
+                    candidates.append(
+                        candidate
+                    )
+
+        # ------------------------------------------------------
+        # Store CURRENT weather observations after the
+        # previous-vs-current comparisons above.
+        # ------------------------------------------------------
+
+        forecast_rows = []
+
+        for model, cities in (
+            deterministic.items()
+        ):
+            for city_name, city_data in (
+                cities.items()
+            ):
+                model_run_time = (
+                    city_data.get(
+                        "model_run_time"
+                    )
+                )
+
+                for forecast_date, daily in (
+                    city_data[
+                        "daily"
+                    ].items()
+                ):
+                    daily_high = daily.get(
+                        "high"
+                    )
+
+                    daily_rain = daily.get(
+                        "precipitation_sum"
+                    )
+
+                    high_payload = {
+                        "high": daily_high
+                    }
+
+                    rain_payload = {
+                        "precipitation_sum": daily_rain
+                    }
+
+                    high_hash = hashlib.sha256(
+                        json.dumps(
+                            high_payload,
+                            sort_keys=True,
+                        ).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+
+                    rain_hash = hashlib.sha256(
+                        json.dumps(
+                            rain_payload,
+                            sort_keys=True,
+                        ).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+
+                    forecast_rows.append(
+                        (
+                            city_name,
+                            model,
+                            "temperature_high",
+                            forecast_date,
+                            model_run_time,
+                            daily_high,
+                            None,
+                            Json(
+                                high_payload
+                            ),
+                            high_hash,
+                        )
+                    )
+
+                    forecast_rows.append(
+                        (
+                            city_name,
+                            model,
+                            "precipitation_sum",
+                            forecast_date,
+                            model_run_time,
+                            daily_rain,
+                            None,
+                            Json(
+                                rain_payload
+                            ),
+                            rain_hash,
+                        )
+                    )
+
+        for city_name, city_data in (
+            ensemble.items()
+        ):
+            for forecast_date, daily in (
+                city_data[
+                    "daily"
+                ].items()
+            ):
+                temp_payload = {
+                    "member_highs": daily[
+                        "member_highs"
+                    ]
+                }
+
+                rain_payload = {
+                    "member_rain_totals": daily[
+                        "member_rain_totals"
+                    ]
+                }
+
+                temp_hash = hashlib.sha256(
+                    json.dumps(
+                        temp_payload,
+                        sort_keys=True,
+                    ).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+
+                rain_hash = hashlib.sha256(
+                    json.dumps(
+                        rain_payload,
+                        sort_keys=True,
+                    ).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+
+                forecast_rows.append(
+                    (
+                        city_name,
+                        "ensemble",
+                        "temperature_distribution",
+                        forecast_date,
+                        city_data.get(
+                            "model_run_time"
+                        ),
+                        statistics.mean(
+                            daily[
+                                "member_highs"
+                            ]
+                        ),
+                        None,
+                        Json(
+                            temp_payload
+                        ),
+                        temp_hash,
+                    )
+                )
+
+                current_rain_probability = (
+                    rain_probability(
+                        daily[
+                            "member_rain_totals"
+                        ]
+                    )
+                )
+
+                forecast_rows.append(
+                    (
+                        city_name,
+                        "ensemble",
+                        "rain_distribution",
+                        forecast_date,
+                        city_data.get(
+                            "model_run_time"
+                        ),
+                        statistics.mean(
+                            daily[
+                                "member_rain_totals"
+                            ]
+                        ),
+                        current_rain_probability,
+                        Json(
+                            rain_payload
+                        ),
+                        rain_hash,
+                    )
+                )
+
+        market_rows = []
+
+        for entry in market_entries:
+            market = entry[
+                "market"
+            ]
+
+            def d2c(value):
+                number = safe_float(
+                    value
+                )
+                return (
+                    number * 100.0
+                    if number is not None
+                    else None
+                )
+
+            market_rows.append(
+                (
+                    market.get(
+                        "ticker"
+                    ),
+                    market.get(
+                        "event_ticker"
+                    ),
+                    market.get(
+                        "series_ticker"
+                    ),
+                    entry["date"],
+                    entry["city"],
+                    entry["kind"],
+                    d2c(
+                        market.get(
+                            "yes_bid_dollars"
+                        )
+                    ),
+                    d2c(
+                        market.get(
+                            "yes_ask_dollars"
+                        )
+                    ),
+                    d2c(
+                        market.get(
+                            "no_bid_dollars"
+                        )
+                    ),
+                    d2c(
+                        market.get(
+                            "no_ask_dollars"
+                        )
+                    ),
+                    d2c(
+                        market.get(
+                            "last_price_dollars"
+                        )
+                    ),
+                    market.get(
+                        "status"
+                    ),
+                    market.get(
+                        "result"
+                    ),
+                    Json(market),
+                )
             )
 
-    for series in rain_series_list:
-        if (series.get("ticker") or "").upper() != "KXRAIN":
-            continue
-        try:
-            markets = get_series_markets("KXRAIN")
-        except Exception as exc:
-            log.warning(
-                "KXRAIN snapshot fetch failed: %s",
-                exc,
+        with db_connect() as conn:
+            store_forecasts(
+                conn,
+                forecast_rows,
             )
-            continue
-        for market in markets:
-            location = rain_city_from_ticker(
-                market.get("ticker")
+            store_markets(
+                conn,
+                market_rows,
             )
-            city = location[0] if location else None
-            insert_market_snapshot(
-                market,
-                city,
-                "rain",
+
+        # ------------------------------------------------------
+        # One strongest signal per city/date.
+        # ------------------------------------------------------
+
+        selected = {}
+
+        for candidate in candidates:
+            key = (
+                candidate["city"],
+                candidate["forecast_date"],
             )
-        break
 
+            if key not in selected:
+                selected[
+                    key
+                ] = candidate
+                continue
 
-def emit_signal(signal, series, stats):
-    reason = {
-        "strategy": "large weather forecast shock plus insufficient market response",
-        "model_probability_is_calibrated": False,
-        "ensemble_model": ENSEMBLE_MODEL,
-        "paper_risk_dollars": PAPER_RISK_DOLLARS,
-        "series_settlement_sources": series.get("settlement_sources", []),
-        "contract_terms_url": series.get("contract_terms_url"),
-        "location_signal_gate": "verified_only" if not ALLOW_UNVERIFIED_LOCATION_SIGNALS else "proxy_allowed",
-    }
+            old = selected[
+                key
+            ]
 
-    fp = open_paper_trade(
-        signal,
-        reason,
-    )
-
-    # A paper trade is persistent even if Discord is temporarily unavailable.
-    # The alert log is recorded ONLY after Discord successfully accepts it.
-    if not alert_exists(fp):
-        if send_discord(signal_message(signal)):
-            record_alert(
-                fp,
-                {
-                    "signal": signal,
-                    "reason": reason,
-                },
+            new_score = (
+                candidate[
+                    "market_lag_points"
+                ],
+                candidate[
+                    "preliminary_edge_points"
+                ],
             )
-            stats["discord_alerts"] += 1
-            log.info(
-                "DISCORD ALERT SENT | %s | %s | %s",
-                signal["city"],
-                signal["market_ticker"],
+
+            old_score = (
+                old[
+                    "market_lag_points"
+                ],
+                old[
+                    "preliminary_edge_points"
+                ],
+            )
+
+            if new_score > old_score:
+                selected[
+                    key
+                ] = candidate
+
+        # ------------------------------------------------------
+        # Paper trades and alerts.
+        # A paper trade is recorded independently of Discord.
+        # Discord failure must not erase a qualifying paper trade.
+        # ------------------------------------------------------
+
+        for signal in selected.values():
+            reason = {
+                "strategy": (
+                    "large forecast probability "
+                    "shock plus insufficient market "
+                    "response"
+                ),
+                "location_station": CITIES[
+                    signal["city"]
+                ]["station"],
+                "raw_ensemble_probability": True,
+                "calibrated_probability": False,
+                "paper_only": True,
+                "allow_unverified_signals": (
+                    ALLOW_UNVERIFIED_SIGNALS
+                ),
+            }
+
+            created, fp = (
+                open_paper_trade(
+                    signal,
+                    reason,
+                )
+            )
+
+            if not created:
+                continue
+
+            logger.info(
+                "PAPER TRADE OPENED | "
+                "%s | %s | %s | %.1f¢",
+                signal["ticker"],
                 signal["side"],
-            )
-        else:
-            log.error(
-                "Discord alert failed; paper trade remains recorded for retry."
+                signal["city"],
+                signal[
+                    "entry_price_cents"
+                ],
             )
 
-    stats["paper_trades_created"] += 1
+            alert_payload = {
+                "signal": signal,
+                "fingerprint": fp,
+            }
+
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM alert_log
+                        WHERE fingerprint=%s
+                        LIMIT 1
+                        """,
+                        (fp,),
+                    )
+                    already_alerted = (
+                        cur.fetchone()
+                        is not None
+                    )
+
+            if already_alerted:
+                continue
+
+            delivered = (
+                send_signal_alert(
+                    signal,
+                    fp,
+                )
+            )
+
+            if delivered:
+                with db_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO alert_log(
+                                fingerprint,
+                                message
+                            )
+                            VALUES(
+                                %s,%s
+                            )
+                            ON CONFLICT(
+                                fingerprint
+                            )
+                            DO NOTHING
+                            """,
+                            (
+                                fp,
+                                Json(
+                                    alert_payload
+                                ),
+                            ),
+                        )
+
+        settle_paper_trades()
+
+        elapsed = (
+            time.monotonic()
+            - started
+        )
+
+        logger.info(
+            "SCAN COMPLETE | "
+            "cities=%d | "
+            "temp_series=%d | "
+            "temp_markets=%d | "
+            "rain_markets=%d | "
+            "candidate_signals=%d | "
+            "selected_signals=%d | "
+            "elapsed=%.1fs",
+            len(CITIES),
+            len(temperature_results),
+            sum(
+                len(markets)
+                for _, markets
+                in temperature_results
+            ),
+            len(rain_markets),
+            len(candidates),
+            len(selected),
+            elapsed,
+        )
+
+        logger.info(
+            "This scan used raw ensemble-frequency "
+            "proxies only; no calibrated probability "
+            "claim is being made."
+        )
+
+        finish_run(
+            run_id,
+            True,
+            None,
+        )
+
+    except Exception as error:
+        finish_run(
+            run_id,
+            False,
+            str(error),
+        )
+        raise
+
+
+def today_for_city(
+    city_data,
+):
+    return datetime.now(
+        ZoneInfo(
+            city_data["timezone"]
+        )
+    ).date().isoformat()
+
+
+def rain_city_from_ticker(
+    ticker,
+):
+    parts = (
+        ticker or ""
+    ).split("-")
+
+    if len(parts) < 3:
+        return None
+
+    return RAIN_CODE_TO_CITY.get(
+        parts[-1]
+    )
 
 
 if __name__ == "__main__":
-    run_scan()
+    start = time.monotonic()
+
+    try:
+        logger.info(
+            "Starting one-shot weather/Kalshi scan."
+        )
+
+        scan()
+
+        logger.info(
+            "One-shot scan completed successfully "
+            "in %.1f seconds.",
+            time.monotonic() - start,
+        )
+
+    except Exception:
+        logger.exception(
+            "One-shot scan FAILED after %.1f seconds.",
+            time.monotonic() - start,
+        )
+        raise
