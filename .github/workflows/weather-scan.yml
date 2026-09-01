@@ -12,6 +12,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -20,7 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -30,14 +31,5 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DISCORD_RELAY_URL: ${{ secrets.DISCORD_RELAY_URL }}
           DISCORD_RELAY_SECRET: ${{ secrets.DISCORD_RELAY_SECRET }}
-          KALSHI_API_URL: ${{ vars.KALSHI_API_URL }}
-          FORECAST_DAYS: ${{ vars.FORECAST_DAYS }}
-          WEATHER_REFRESH_SECONDS: ${{ vars.WEATHER_REFRESH_SECONDS }}
-          MIN_FORECAST_PROBABILITY_CHANGE_POINTS: ${{ vars.MIN_FORECAST_PROBABILITY_CHANGE_POINTS }}
-          MIN_MARKET_LAG_POINTS: ${{ vars.MIN_MARKET_LAG_POINTS }}
-          MIN_PRELIMINARY_EDGE_POINTS: ${{ vars.MIN_PRELIMINARY_EDGE_POINTS }}
-          MIN_ENTRY_PRICE_CENTS: ${{ vars.MIN_ENTRY_PRICE_CENTS }}
-          MAX_ENTRY_PRICE_CENTS: ${{ vars.MAX_ENTRY_PRICE_CENTS }}
-          PAPER_RISK_DOLLARS: ${{ vars.PAPER_RISK_DOLLARS }}
-          ALLOW_UNVERIFIED_LOCATION_SIGNALS: ${{ vars.ALLOW_UNVERIFIED_LOCATION_SIGNALS }}
+          KALSHI_API_URL: ${{ secrets.KALSHI_API_URL }}
         run: python scanner.py
