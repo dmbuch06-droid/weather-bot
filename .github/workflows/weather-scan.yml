@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -23,10 +26,26 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Run one weather market scan
+      - name: Run scanner and save log
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DISCORD_RELAY_URL: ${{ secrets.DISCORD_RELAY_URL }}
           DISCORD_RELAY_SECRET: ${{ secrets.DISCORD_RELAY_SECRET }}
           KALSHI_API_URL: ${{ secrets.KALSHI_API_URL }}
-        run: python scanner.py
+          PYTHONUNBUFFERED: "1"
+        shell: bash
+        run: |
+          set +e
+          python -u scanner.py 2>&1 | tee scanner.log
+          exit_code=${PIPESTATUS[0]}
+          echo "scanner_exit_code=$exit_code"
+          exit "$exit_code"
+
+      - name: Upload scanner log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-log-${{ github.run_id }}
+          path: scanner.log
+          if-no-files-found: warn
+          retention-days: 7
