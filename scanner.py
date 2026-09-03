@@ -37,6 +37,7 @@ MIN_PRELIMINARY_EDGE_POINTS = float(
 MIN_ENTRY_PRICE_CENTS = float(os.environ.get("MIN_ENTRY_PRICE_CENTS", "5"))
 MAX_ENTRY_PRICE_CENTS = float(os.environ.get("MAX_ENTRY_PRICE_CENTS", "95"))
 PAPER_RISK_DOLLARS = float(os.environ.get("PAPER_RISK_DOLLARS", "10"))
+RESEARCH_MIN_FORECAST_CHANGE_POINTS = float(os.environ.get("RESEARCH_MIN_FORECAST_CHANGE_POINTS", "3"))
 RAIN_SIGNAL_CODES = {"NYC", "CHI", "MIA", "AUS"}
 
 _DB_CONN = None
@@ -217,6 +218,58 @@ def ensure_schema():
             sent_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS forecast_research_events (
+            id BIGSERIAL PRIMARY KEY,
+            event_fingerprint TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            city TEXT NOT NULL,
+            forecast_date DATE NOT NULL,
+            variable TEXT NOT NULL,
+            market_ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            previous_probability DOUBLE PRECISION NOT NULL,
+            current_probability DOUBLE PRECISION NOT NULL,
+            forecast_probability_change_points DOUBLE PRECISION NOT NULL,
+            pre_forecast_ask_cents DOUBLE PRECISION,
+            event_ask_cents DOUBLE PRECISION,
+            initial_market_change_points DOUBLE PRECISION,
+            initial_market_lag_points DOUBLE PRECISION,
+            initial_preliminary_edge_points DOUBLE PRECISION,
+            first_response_at TIMESTAMPTZ,
+            milestone_25_at TIMESTAMPTZ,
+            milestone_50_at TIMESTAMPTZ,
+            milestone_75_at TIMESTAMPTZ,
+            milestone_90_at TIMESTAMPTZ,
+            latest_observation_at TIMESTAMPTZ,
+            latest_ask_cents DOUBLE PRECISION,
+            latest_market_move_points DOUBLE PRECISION,
+            latest_lag_remaining_points DOUBLE PRECISION,
+            max_market_move_points DOUBLE PRECISION DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TIMESTAMPTZ,
+            settlement_result TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS forecast_research_updates (
+            id BIGSERIAL PRIMARY KEY,
+            event_id BIGINT NOT NULL REFERENCES forecast_research_events(id) ON DELETE CASCADE,
+            observed_at TIMESTAMPTZ NOT NULL,
+            market_ask_cents DOUBLE PRECISION,
+            market_move_points DOUBLE PRECISION,
+            lag_remaining_points DOUBLE PRECISION,
+            market_response_fraction DOUBLE PRECISION
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_research_events_open
+        ON forecast_research_events(status, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_research_updates_event
+        ON forecast_research_updates(event_id, observed_at DESC)
         """,
     ]
     for sql in statements:
@@ -1051,6 +1104,176 @@ def insert_market_snapshot(market, city, kind):
     )
 
 
+def research_event_fingerprint(city, date_key, variable, ticker, side, forecast_signature):
+    raw = "|".join([city, date_key, variable, ticker, side, forecast_signature])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def record_research_event(city, date_key, variable, market, side, previous_probability, current_probability, previous_market_ask, current_market_ask, forecast_signature, stats):
+    if current_probability is None or previous_probability is None:
+        return
+    forecast_change = current_probability - previous_probability
+    side_forecast_change = forecast_change if side == "YES" else -forecast_change
+    if abs(side_forecast_change) < RESEARCH_MIN_FORECAST_CHANGE_POINTS:
+        return
+    if previous_market_ask is None or current_market_ask is None:
+        return
+
+    ticker = market.get("ticker") or ""
+    side_probability = current_probability if side == "YES" else 100.0 - current_probability
+    initial_market_change = current_market_ask - previous_market_ask
+    initial_lag = side_forecast_change - initial_market_change
+    initial_edge = side_probability - current_market_ask
+    status = "open" if initial_lag > 0 else "no_initial_lag"
+    fp = research_event_fingerprint(city, date_key, variable, ticker, side, forecast_signature)
+
+    row = db_execute(
+        """
+        INSERT INTO forecast_research_events(
+            event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,
+            previous_probability,current_probability,forecast_probability_change_points,
+            pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,
+            initial_market_lag_points,initial_preliminary_edge_points,status
+        ) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(event_fingerprint) DO NOTHING
+        RETURNING id
+        """,
+        (
+            fp, city, date_key, variable, ticker, side,
+            previous_probability if side == "YES" else 100.0 - previous_probability,
+            side_probability, side_forecast_change, previous_market_ask, current_market_ask,
+            initial_market_change, initial_lag, initial_edge, status,
+        ),
+        fetchone=True,
+    )
+    if row:
+        stats["research_events_created"] += 1
+        log.info(
+            "RESEARCH EVENT | %s | %s | %s | %s | prob %.1f -> %.1f | market %.1f -> %.1f | lag %.1f pts | edge %.1f pts",
+            variable, city, date_key, ticker,
+            previous_probability if side == "YES" else 100.0 - previous_probability,
+            side_probability, previous_market_ask, current_market_ask, initial_lag, initial_edge,
+        )
+
+
+def record_research_temperature(temp_series, ensemble, stats):
+    for series in temp_series:
+        location = location_from_title_or_ticker(series)
+        if location is None:
+            continue
+        city, _, _, tz_name, _ = location
+        for market in get_series_markets(series.get("ticker")):
+            date_key = parse_market_date(market)
+            if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
+                continue
+            daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+            previous = prior_member_data(city, date_key, "ensemble_temperature_distribution")
+            if not daily or not previous:
+                continue
+            current_members = daily.get("member_highs") or []
+            previous_members = previous.get("member_highs") or []
+            if not current_members or not previous_members:
+                continue
+            current_prob = temperature_probability(current_members, market)
+            previous_prob = temperature_probability(previous_members, market)
+            prev_market = latest_market(market.get("ticker") or "")
+            for side in ("YES", "NO"):
+                current_ask = get_side_ask_cents(market, side)
+                previous_ask = None if not prev_market else safe_float(prev_market[2] if side == "YES" else prev_market[4])
+                record_research_event(city, date_key, "temperature", market, side, previous_prob, current_prob, previous_ask, current_ask, payload_hash({"member_highs": current_members}), stats)
+
+
+def record_research_rain(city_names, ensemble, stats):
+    for market in get_series_markets("KXRAIN"):
+        code = rain_city_from_ticker(market)
+        if code not in city_names:
+            continue
+        city, _, _, tz_name, _ = LOCATION_MAP[code]
+        date_key = parse_market_date(market)
+        if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
+            continue
+        daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+        previous = prior_rain_member_data(city, date_key)
+        if not daily or not previous:
+            continue
+        current_members = daily.get("member_precip_totals") or []
+        previous_members = previous.get("member_precip_totals") or []
+        if not current_members or not previous_members:
+            continue
+        current_prob = rain_probability(current_members)
+        previous_prob = rain_probability(previous_members)
+        prev_market = latest_market(market.get("ticker") or "")
+        for side in ("YES", "NO"):
+            current_ask = get_side_ask_cents(market, side)
+            previous_ask = None if not prev_market else safe_float(prev_market[2] if side == "YES" else prev_market[4])
+            record_research_event(city, date_key, "precipitation", market, side, previous_prob, current_prob, previous_ask, current_ask, payload_hash({"member_precip_totals": current_members}), stats)
+
+
+def research_observe_market_progress(stats):
+    rows = db_execute(
+        """
+        SELECT id,city,forecast_date,variable,market_ticker,side,created_at,event_ask_cents,
+               initial_market_lag_points,first_response_at,milestone_25_at,milestone_50_at,
+               milestone_75_at,milestone_90_at,max_market_move_points
+        FROM forecast_research_events
+        WHERE status='open'
+        ORDER BY created_at ASC
+        LIMIT 1000
+        """,
+        fetch=True,
+    ) or []
+    for row in rows:
+        (event_id, city, forecast_date, variable, ticker, side, created_at, event_ask,
+         initial_lag, first_response_at, m25, m50, m75, m90, max_move) = row
+        if initial_lag is None or initial_lag <= 0 or event_ask is None:
+            continue
+        snapshot = db_execute(
+            """
+            SELECT observed_at,
+                   CASE WHEN %s='YES' THEN yes_ask_cents ELSE no_ask_cents END
+            FROM market_snapshots
+            WHERE ticker=%s AND observed_at>%s
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            (side, ticker, created_at), fetchone=True,
+        )
+        if not snapshot or snapshot[1] is None:
+            continue
+        observed_at, current_ask = snapshot
+        market_move = current_ask - event_ask
+        response_fraction = market_move / initial_lag if initial_lag else 0.0
+        lag_remaining = initial_lag - market_move
+        max_move_new = max(max_move or 0.0, market_move)
+        db_execute(
+            """
+            INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction)
+            VALUES(%s,%s,%s,%s,%s,%s)
+            """,
+            (event_id, observed_at, current_ask, market_move, lag_remaining, response_fraction),
+        )
+        updates = {
+            "latest_observation_at": observed_at,
+            "latest_ask_cents": current_ask,
+            "latest_market_move_points": market_move,
+            "latest_lag_remaining_points": lag_remaining,
+            "max_market_move_points": max_move_new,
+        }
+        if first_response_at is None and market_move > 0:
+            updates["first_response_at"] = observed_at
+        for fraction, column, existing in ((0.25, "milestone_25_at", m25),(0.50, "milestone_50_at", m50),(0.75, "milestone_75_at", m75),(0.90, "milestone_90_at", m90)):
+            if existing is None and market_move >= initial_lag * fraction:
+                updates[column] = observed_at
+                if fraction == 0.90:
+                    log.info("RESEARCH ADAPTED 90%% | %s | %s | %s | %.1fs", variable, city, ticker, (observed_at-created_at).total_seconds())
+        assignments = [f"{k}=%s" for k in updates]
+        db_execute(
+            f"UPDATE forecast_research_events SET {', '.join(assignments)} WHERE id=%s",
+            tuple(list(updates.values()) + [event_id]),
+        )
+        stats["research_events_observed"] += 1
+
+
 def process_temperature_signals(temp_series, ensemble, stats):
     for series in temp_series:
         location = location_from_title_or_ticker(series)
@@ -1220,6 +1443,8 @@ def run_scan():
         "rain_signals_enabled": True,
         "rain_markets": 0,
         "rain_forecast_shocks": 0,
+        "research_events_created": 0,
+        "research_events_observed": 0,
     }
     started = time.time()
 
@@ -1274,6 +1499,8 @@ def run_scan():
             # Important: compare against the previous forecast BEFORE saving the new baseline.
             process_temperature_signals(temp_series, ensemble, stats)
             process_rain_signals(city_names, ensemble, stats)
+            record_research_temperature(temp_series, ensemble, stats)
+            record_research_rain(city_names, ensemble, stats)
 
             save_weather_forecasts(deterministic, ensemble)
         else:
@@ -1281,6 +1508,7 @@ def run_scan():
 
         # Market snapshots happen every scan, including scans without a new weather run.
         collect_market_snapshots(temp_series, stats, city_names)
+        research_observe_market_progress(stats)
         stats["settled_trades"] += settle_paper_trades()
         finish_scan_run(scan_id, "success", stats)
         log.info("SCAN COMPLETE | %s | runtime=%.1fs", json.dumps(stats, default=str), time.time() - started)
