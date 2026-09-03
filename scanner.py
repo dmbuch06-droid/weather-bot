@@ -1110,14 +1110,18 @@ def research_event_fingerprint(city, date_key, variable, ticker, side, forecast_
 
 
 def record_research_event(city, date_key, variable, market, side, previous_probability, current_probability, previous_market_ask, current_market_ask, forecast_signature, stats):
+    stats["research_contracts_evaluated"] += 1
     if current_probability is None or previous_probability is None:
         return
     forecast_change = current_probability - previous_probability
     side_forecast_change = forecast_change if side == "YES" else -forecast_change
     if abs(side_forecast_change) < RESEARCH_MIN_FORECAST_CHANGE_POINTS:
         return
+    stats["research_probability_changes"] += 1
     if previous_market_ask is None or current_market_ask is None:
+        stats["research_events_no_market_history"] += 1
         return
+    stats["research_market_price_pairs"] += 1
 
     ticker = market.get("ticker") or ""
     side_probability = current_probability if side == "YES" else 100.0 - current_probability
@@ -1445,6 +1449,10 @@ def run_scan():
         "rain_forecast_shocks": 0,
         "research_events_created": 0,
         "research_events_observed": 0,
+        "research_contracts_evaluated": 0,
+        "research_probability_changes": 0,
+        "research_market_price_pairs": 0,
+        "research_events_no_market_history": 0,
     }
     started = time.time()
 
@@ -1511,6 +1519,16 @@ def run_scan():
         research_observe_market_progress(stats)
         stats["settled_trades"] += settle_paper_trades()
         finish_scan_run(scan_id, "success", stats)
+        log.info(
+            "RESEARCH SUMMARY | evaluated=%d | forecast_changes_ge_%g=%d | market_pairs=%d | missing_market_history=%d | events_created=%d | events_observed=%d",
+            stats["research_contracts_evaluated"],
+            RESEARCH_MIN_FORECAST_CHANGE_POINTS,
+            stats["research_probability_changes"],
+            stats["research_market_price_pairs"],
+            stats["research_events_no_market_history"],
+            stats["research_events_created"],
+            stats["research_events_observed"],
+        )
         log.info("SCAN COMPLETE | %s | runtime=%.1fs", json.dumps(stats, default=str), time.time() - started)
     except Exception as exc:
         log.exception("SCAN FAILED")
