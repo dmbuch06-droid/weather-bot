@@ -296,18 +296,35 @@ def parse_market_date(market):
 def location_from_title_or_ticker(series):
     title = (series.get("title") or "").upper()
     ticker = (series.get("ticker") or "").upper()
+
+    # Current Kalshi weather series use tickers such as KXHIGHNY,
+    # KXHIGHCHI, KXHIGHMIA, and KXHIGHAUS. Older/duplicate series
+    # such as HIGHCHI may also appear in the API response. Prefer the
+    # explicit ticker mapping before falling back to title matching.
+    ticker_map = (
+        ("KXHIGHNY", "NYC"),
+        ("HIGHNY", "NYC"),
+        ("KXHIGHCHI", "CHI"),
+        ("HIGHCHI", "CHI"),
+        ("KXHIGHMIA", "MIA"),
+        ("HIGHMIA", "MIA"),
+        ("KXHIGHAUS", "AUS"),
+        ("HIGHAUS", "AUS"),
+    )
+    for prefix, code in ticker_map:
+        if ticker == prefix or ticker.startswith(prefix + "-") or prefix in ticker:
+            return LOCATION_MAP[code]
+
     aliases = {
         "NEW YORK CITY": "NYC",
         "NEW YORK": "NYC",
+        "NYC": "NYC",
         "CHICAGO": "CHI",
         "MIAMI": "MIA",
         "AUSTIN": "AUS",
     }
     for alias, code in aliases.items():
         if alias in title:
-            return LOCATION_MAP[code]
-    for code in LOCATION_MAP:
-        if ticker.endswith(code) or ticker.endswith(f"-{code}"):
             return LOCATION_MAP[code]
     return None
 
@@ -819,35 +836,51 @@ def get_series_list():
 
 
 def save_series_registry(series_list):
+    # Save all discovered series in one database transaction. The previous
+    # implementation opened a fresh PostgreSQL connection for every series,
+    # which made a 300+ series response unnecessarily slow.
+    rows = []
     for series in series_list:
         ticker = series.get("ticker")
         if not ticker:
             continue
-        db_execute(
-            """
-            INSERT INTO series_registry(
-                series_ticker,title,category,tags,settlement_sources,
-                contract_terms_url,updated_at,raw_series
-            ) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s)
-            ON CONFLICT(series_ticker) DO UPDATE SET
-                title=EXCLUDED.title,
-                category=EXCLUDED.category,
-                tags=EXCLUDED.tags,
-                settlement_sources=EXCLUDED.settlement_sources,
-                contract_terms_url=EXCLUDED.contract_terms_url,
-                updated_at=NOW(),
-                raw_series=EXCLUDED.raw_series
-            """,
+        rows.append(
             (
                 ticker,
                 series.get("title", ""),
                 series.get("category"),
-                Json(series.get("tags", [])),
-                Json(series.get("settlement_sources", [])),
+                Json(series.get("tags") or []),
+                Json(series.get("settlement_sources") or []),
                 series.get("contract_terms_url"),
                 Json(series),
-            ),
+            )
         )
+    if not rows:
+        return
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO series_registry(
+                    series_ticker,title,category,tags,settlement_sources,
+                    contract_terms_url,updated_at,raw_series
+                ) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s)
+                ON CONFLICT(series_ticker) DO UPDATE SET
+                    title=EXCLUDED.title,
+                    category=EXCLUDED.category,
+                    tags=EXCLUDED.tags,
+                    settlement_sources=EXCLUDED.settlement_sources,
+                    contract_terms_url=EXCLUDED.contract_terms_url,
+                    updated_at=NOW(),
+                    raw_series=EXCLUDED.raw_series
+            """
+            cur.executemany(sql, rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def get_series_markets(series_ticker):
@@ -865,14 +898,32 @@ def get_series_markets(series_ticker):
 
 
 def select_relevant_temperature_series(all_series):
-    result = []
+    # There can be duplicate/legacy series for the same city. For signal
+    # generation and market snapshots, keep one canonical series per city,
+    # preferring the current KXHIGH* ticker family.
+    candidates = defaultdict(list)
     for series in all_series:
         if not temperature_series(series):
             continue
         location = location_from_title_or_ticker(series)
         if location is None:
             continue
-        result.append(series)
+        city = location[0]
+        candidates[city].append(series)
+
+    result = []
+    for city, series_list in sorted(candidates.items()):
+        def rank(series):
+            ticker = (series.get("ticker") or "").upper()
+            return (0 if ticker.startswith("KXHIGH") else 1, ticker)
+        chosen = sorted(series_list, key=rank)[0]
+        result.append(chosen)
+        if len(series_list) > 1:
+            discarded = [s.get("ticker") for s in series_list if s is not chosen]
+            log.info(
+                "Using canonical temperature series for %s: %s | ignoring duplicates: %s",
+                city, chosen.get("ticker"), ", ".join(x or "?" for x in discarded),
+            )
     return result
 
 
@@ -1019,7 +1070,9 @@ def run_scan():
         stats["settled_trades"] = settle_paper_trades()
 
         all_series = get_series_list()
+        registry_started = time.time()
         save_series_registry(all_series)
+        log.info("Series registry saved: %d series in %.1fs", len(all_series), time.time() - registry_started)
         temp_series = select_relevant_temperature_series(all_series)
         stats["temperature_series"] = len(temp_series)
         log.info("Relevant temperature series: %d", len(temp_series))
