@@ -1166,6 +1166,7 @@ def record_research_temperature(temp_series, ensemble, stats):
         if location is None:
             continue
         city, _, _, tz_name, _ = location
+        code = next(code for code, entry in LOCATION_MAP.items() if entry == location)
         markets = get_series_markets(series.get("ticker"))
         for market in markets:
             stats["research_markets_considered"] += 2
@@ -1174,13 +1175,13 @@ def record_research_temperature(temp_series, ensemble, stats):
                 continue
             if date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
                 continue
-            daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+            daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
             if daily:
                 stats["research_current_forecasts"] += 1
             else:
                 stats["research_missing_current_forecast"] += 1
                 continue
-            previous = prior_member_data(city, date_key, "ensemble_temperature_distribution")
+            previous = prior_member_data(code, date_key, "ensemble_temperature_distribution")
             if previous:
                 stats["research_previous_forecasts"] += 1
             else:
@@ -1214,13 +1215,13 @@ def record_research_rain(city_names, ensemble, stats):
         if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
             continue
         stats["research_markets_considered"] += 2
-        daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+        daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
         if daily:
             stats["research_current_forecasts"] += 1
         else:
             stats["research_missing_current_forecast"] += 1
             continue
-        previous = prior_rain_member_data(city, date_key)
+        previous = prior_rain_member_data(code, date_key)
         if previous:
             stats["research_previous_forecasts"] += 1
         else:
@@ -1334,6 +1335,7 @@ def process_temperature_signals(temp_series, ensemble, stats):
         if location is None:
             continue
         city, _, _, tz_name, _ = location
+        code = next(code for code, entry in LOCATION_MAP.items() if entry == location)
         if not location_signal_allowed(location):
             continue
 
@@ -1346,11 +1348,11 @@ def process_temperature_signals(temp_series, ensemble, stats):
             if date_key < today:
                 continue
 
-            current_daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+            current_daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
             if not current_daily:
                 continue
             current_members = current_daily.get("member_highs") or []
-            previous = prior_member_data(city, date_key, "ensemble_temperature_distribution")
+            previous = prior_member_data(code, date_key, "ensemble_temperature_distribution")
             previous_members = (previous or {}).get("member_highs") or []
             if not previous_members:
                 continue
@@ -1415,11 +1417,11 @@ def process_rain_signals(city_names, ensemble, stats):
             if date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
                 continue
 
-            current_daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+            current_daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
             if not current_daily:
                 continue
             current_members = current_daily.get("member_precip_totals") or []
-            previous = prior_rain_member_data(city, date_key)
+            previous = prior_rain_member_data(code, date_key)
             previous_members = (previous or {}).get("member_precip_totals") or []
             if not previous_members:
                 continue
