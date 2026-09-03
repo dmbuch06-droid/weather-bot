@@ -25,8 +25,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DISCORD_RELAY_URL = os.environ.get("DISCORD_RELAY_URL", "").strip()
 DISCORD_RELAY_SECRET = os.environ.get("DISCORD_RELAY_SECRET", "").strip()
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
+NWS_API_URL = "https://api.weather.gov"
+NWS_USER_AGENT = os.environ.get("NWS_USER_AGENT", "WeatherKalshiResearchBot/1.0")
 FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
-WEATHER_REFRESH_SECONDS = int(os.environ.get("WEATHER_REFRESH_SECONDS", "1800"))
 MIN_FORECAST_PROBABILITY_CHANGE_POINTS = float(
     os.environ.get("MIN_FORECAST_PROBABILITY_CHANGE_POINTS", "20")
 )
@@ -136,6 +137,14 @@ def ensure_schema():
             contract_terms_url TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             raw_series JSONB NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS weather_service_state (
+            city_code TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            last_update_at TIMESTAMPTZ NOT NULL,
+            checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
         """
@@ -331,19 +340,6 @@ def latest_market(ticker):
     )
 
 
-def get_latest_weather_fetch_time():
-    row = db_execute(
-        """
-        SELECT MAX(started_at)
-        FROM scan_runs
-        WHERE status='success'
-          AND (stats->>'weather_refreshed')='true'
-        """,
-        fetchone=True,
-    )
-    return row[0] if row and row[0] else None
-
-
 def parse_market_date(market):
     event_ticker = market.get("event_ticker") or ""
     ticker = market.get("ticker") or ""
@@ -428,6 +424,83 @@ def http_json(url, params=None):
         return response.json()
     except ValueError as exc:
         raise RuntimeError("API returned invalid JSON") from exc
+
+
+def nws_json(url):
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": NWS_USER_AGENT,
+            "Accept": "application/geo+json, application/ld+json, application/json",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(f"NWS {response.status_code}: {response.text[:500]}")
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("NWS API returned invalid JSON") from exc
+
+
+def fetch_nws_updates(city_names):
+    """Return each city's current NWS forecast update timestamp.
+
+    We use NWS only as the publication/update trigger and provenance reference.
+    GFS ensemble remains the probability source used by the existing strategy.
+    """
+    updates = {}
+    for code in city_names:
+        _, lat, lon, _, _ = LOCATION_MAP[code]
+        point = nws_json(f"{NWS_API_URL}/points/{lat},{lon}")
+        forecast_url = (point.get("properties") or {}).get("forecastHourly")
+        if not forecast_url:
+            raise RuntimeError(f"NWS: no hourly forecast URL for {code}")
+        forecast = nws_json(forecast_url)
+        properties = forecast.get("properties") or {}
+        updated = properties.get("updated") or properties.get("updateTime")
+        if not updated:
+            raise RuntimeError(f"NWS: no update timestamp for {code}")
+        dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        updates[code] = dt.astimezone(timezone.utc)
+    return updates
+
+
+def get_nws_state(code):
+    row = db_execute(
+        "SELECT last_update_at FROM weather_service_state WHERE city_code=%s AND source='nws'",
+        (code,),
+        fetchone=True,
+    )
+    return row[0] if row else None
+
+
+def save_nws_state(updates):
+    for code, updated_at in updates.items():
+        db_execute(
+            """
+            INSERT INTO weather_service_state(city_code,source,last_update_at,checked_at)
+            VALUES(%s,'nws',%s,NOW())
+            ON CONFLICT(city_code) DO UPDATE SET
+                source='nws',
+                last_update_at=EXCLUDED.last_update_at,
+                checked_at=NOW()
+            """,
+            (code, updated_at),
+        )
+
+
+def detect_nws_updates(city_names):
+    """Check whether NWS has published a newer forecast for any monitored city."""
+    updates = fetch_nws_updates(city_names)
+    changed = {}
+    for code, updated_at in updates.items():
+        last_update = get_nws_state(code)
+        if last_update is None or updated_at > last_update:
+            changed[code] = updated_at
+    return updates, changed
 
 
 def location_params(city_names):
@@ -1110,18 +1183,14 @@ def research_event_fingerprint(city, date_key, variable, ticker, side, forecast_
 
 
 def record_research_event(city, date_key, variable, market, side, previous_probability, current_probability, previous_market_ask, current_market_ask, forecast_signature, stats):
-    stats["research_contracts_evaluated"] += 1
     if current_probability is None or previous_probability is None:
         return
     forecast_change = current_probability - previous_probability
     side_forecast_change = forecast_change if side == "YES" else -forecast_change
     if abs(side_forecast_change) < RESEARCH_MIN_FORECAST_CHANGE_POINTS:
         return
-    stats["research_probability_changes"] += 1
     if previous_market_ask is None or current_market_ask is None:
-        stats["research_events_no_market_history"] += 1
         return
-    stats["research_market_price_pairs"] += 1
 
     ticker = market.get("ticker") or ""
     side_probability = current_probability if side == "YES" else 100.0 - current_probability
@@ -1169,40 +1238,34 @@ def record_research_temperature(temp_series, ensemble, stats):
         code = next(code for code, entry in LOCATION_MAP.items() if entry == location)
         markets = get_series_markets(series.get("ticker"))
         for market in markets:
-            stats["research_markets_considered"] += 2
+            stats["research_markets_considered"] += 1
             date_key = parse_market_date(market)
-            if not date_key:
-                continue
-            if date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
+            if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
                 continue
             daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
-            if daily:
-                stats["research_current_forecasts"] += 1
-            else:
-                stats["research_missing_current_forecast"] += 1
-                continue
             previous = prior_member_data(code, date_key, "ensemble_temperature_distribution")
-            if previous:
-                stats["research_previous_forecasts"] += 1
-            else:
+            if not daily:
+                continue
+            if not previous:
                 stats["research_missing_previous_forecast"] += 1
                 continue
             current_members = daily.get("member_highs") or []
             previous_members = previous.get("member_highs") or []
-            if not current_members or not previous_members:
-                stats["research_invalid_probability_pairs"] += 2
-                continue
             current_prob = temperature_probability(current_members, market)
             previous_prob = temperature_probability(previous_members, market)
             if current_prob is None or previous_prob is None:
-                stats["research_invalid_probability_pairs"] += 2
                 continue
-            stats["research_probability_pairs"] += 2
+            stats["research_current_forecasts"] += 1
+            stats["research_previous_forecasts"] += 1
             prev_market = latest_market(market.get("ticker") or "")
             for side in ("YES", "NO"):
                 current_ask = get_side_ask_cents(market, side)
                 previous_ask = None if not prev_market else safe_float(prev_market[2] if side == "YES" else prev_market[4])
-                record_research_event(city, date_key, "temperature", market, side, previous_prob, current_prob, previous_ask, current_ask, payload_hash({"member_highs": current_members}), stats)
+                record_research_event(
+                    city, date_key, "temperature", market, side,
+                    previous_prob, current_prob, previous_ask, current_ask,
+                    payload_hash({"member_highs": current_members}), stats,
+                )
 
 
 def record_research_rain(city_names, ensemble, stats):
@@ -1214,35 +1277,31 @@ def record_research_rain(city_names, ensemble, stats):
         date_key = parse_market_date(market)
         if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
             continue
-        stats["research_markets_considered"] += 2
+        stats["research_markets_considered"] += 1
         daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
-        if daily:
-            stats["research_current_forecasts"] += 1
-        else:
-            stats["research_missing_current_forecast"] += 1
-            continue
         previous = prior_rain_member_data(code, date_key)
-        if previous:
-            stats["research_previous_forecasts"] += 1
-        else:
+        if not daily:
+            continue
+        if not previous:
             stats["research_missing_previous_forecast"] += 1
             continue
         current_members = daily.get("member_precip_totals") or []
         previous_members = previous.get("member_precip_totals") or []
-        if not current_members or not previous_members:
-            stats["research_invalid_probability_pairs"] += 2
-            continue
         current_prob = rain_probability(current_members)
         previous_prob = rain_probability(previous_members)
         if current_prob is None or previous_prob is None:
-            stats["research_invalid_probability_pairs"] += 2
             continue
-        stats["research_probability_pairs"] += 2
+        stats["research_current_forecasts"] += 1
+        stats["research_previous_forecasts"] += 1
         prev_market = latest_market(market.get("ticker") or "")
         for side in ("YES", "NO"):
             current_ask = get_side_ask_cents(market, side)
             previous_ask = None if not prev_market else safe_float(prev_market[2] if side == "YES" else prev_market[4])
-            record_research_event(city, date_key, "precipitation", market, side, previous_prob, current_prob, previous_ask, current_ask, payload_hash({"member_precip_totals": current_members}), stats)
+            record_research_event(
+                city, date_key, "precipitation", market, side,
+                previous_prob, current_prob, previous_ask, current_ask,
+                payload_hash({"member_precip_totals": current_members}), stats,
+            )
 
 
 def research_observe_market_progress(stats, scan_started_at):
@@ -1501,17 +1560,11 @@ def run_scan():
         "rain_forecast_shocks": 0,
         "research_events_created": 0,
         "research_events_observed": 0,
-        "research_contracts_evaluated": 0,
-        "research_probability_changes": 0,
-        "research_market_price_pairs": 0,
-        "research_events_no_market_history": 0,
         "research_markets_considered": 0,
         "research_current_forecasts": 0,
         "research_previous_forecasts": 0,
-        "research_probability_pairs": 0,
         "research_missing_previous_forecast": 0,
-        "research_missing_current_forecast": 0,
-        "research_invalid_probability_pairs": 0,
+        "nws_updates_detected": 0,
     }
     started = time.time()
     scan_started_at = utc_now()
@@ -1543,12 +1596,16 @@ def run_scan():
         city_names = sorted({next(code for code, entry in LOCATION_MAP.items() if entry[0] == name) for name in city_names})
         log.info("Forecast cities: %s", ", ".join(city_names))
 
-        last_weather = get_latest_weather_fetch_time()
-        refresh_weather = (
-            last_weather is None
-            or (utc_now() - last_weather).total_seconds() >= WEATHER_REFRESH_SECONDS
-        )
-        log.info("Weather refresh required: %s", refresh_weather)
+        try:
+            nws_updates, changed_updates = detect_nws_updates(city_names)
+            stats["nws_updates_detected"] = len(changed_updates)
+            for code, updated_at in nws_updates.items():
+                log.info("NWS %s forecast update: %s%s", code, updated_at.isoformat(), " (NEW)" if code in changed_updates else "")
+        except Exception as exc:
+            raise RuntimeError(f"NWS update check failed: {exc}") from exc
+
+        refresh_weather = bool(changed_updates)
+        log.info("New NWS forecast detected: %s", refresh_weather)
 
         if refresh_weather:
             stats["weather_refreshed"] = True
@@ -1564,13 +1621,13 @@ def run_scan():
             ensemble = fetch_ensemble(city_names)
             stats["ensemble_ok"] = True
 
-            # Important: compare against the previous forecast BEFORE saving the new baseline.
             process_temperature_signals(temp_series, ensemble, stats)
             process_rain_signals(city_names, ensemble, stats)
             record_research_temperature(temp_series, ensemble, stats)
             record_research_rain(city_names, ensemble, stats)
 
             save_weather_forecasts(deterministic, ensemble)
+            save_nws_state(nws_updates)
         else:
             ensemble = {}
 
@@ -1580,24 +1637,13 @@ def run_scan():
         stats["settled_trades"] += settle_paper_trades()
         finish_scan_run(scan_id, "success", stats)
         log.info(
-            "RESEARCH SUMMARY | evaluated=%d | forecast_changes_ge_%g=%d | market_pairs=%d | missing_market_history=%d | events_created=%d | events_observed=%d",
-            stats["research_contracts_evaluated"],
-            RESEARCH_MIN_FORECAST_CHANGE_POINTS,
-            stats["research_probability_changes"],
-            stats["research_market_price_pairs"],
-            stats["research_events_no_market_history"],
-            stats["research_events_created"],
-            stats["research_events_observed"],
-        )
-        log.info(
-            "RESEARCH DETAIL | markets_considered=%d | current_forecasts=%d | previous_forecasts=%d | probability_pairs=%d | missing_previous_forecast=%d | missing_current_forecast=%d | invalid_probability_pairs=%d",
+            "RESEARCH | markets=%d | current_forecasts=%d | previous_forecasts=%d | events_created=%d | events_observed=%d | missing_previous=%d",
             stats["research_markets_considered"],
             stats["research_current_forecasts"],
             stats["research_previous_forecasts"],
-            stats["research_probability_pairs"],
+            stats["research_events_created"],
+            stats["research_events_observed"],
             stats["research_missing_previous_forecast"],
-            stats["research_missing_current_forecast"],
-            stats["research_invalid_probability_pairs"],
         )
         log.info("SCAN COMPLETE | %s | runtime=%.1fs", json.dumps(stats, default=str), time.time() - started)
     except Exception as exc:
