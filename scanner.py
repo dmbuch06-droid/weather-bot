@@ -37,6 +37,9 @@ MIN_PRELIMINARY_EDGE_POINTS = float(
 MIN_ENTRY_PRICE_CENTS = float(os.environ.get("MIN_ENTRY_PRICE_CENTS", "5"))
 MAX_ENTRY_PRICE_CENTS = float(os.environ.get("MAX_ENTRY_PRICE_CENTS", "95"))
 PAPER_RISK_DOLLARS = float(os.environ.get("PAPER_RISK_DOLLARS", "10"))
+RAIN_SIGNAL_CODES = {"NYC", "CHI", "MIA", "AUS"}
+
+_DB_CONN = None
 
 # We deliberately do NOT enable automatic signals for unverified settlement
 # locations. All four cities are monitored; only verified entries can signal.
@@ -84,9 +87,11 @@ def db_conn():
 
 
 def db_execute(sql, params=None, fetch=False, fetchone=False):
-    conn = db_conn()
+    global _DB_CONN
+    if _DB_CONN is None or _DB_CONN.closed:
+        _DB_CONN = db_conn()
     try:
-        with conn.cursor() as cur:
+        with _DB_CONN.cursor() as cur:
             cur.execute(sql, params or ())
             if fetchone:
                 result = cur.fetchone()
@@ -94,13 +99,18 @@ def db_execute(sql, params=None, fetch=False, fetchone=False):
                 result = cur.fetchall()
             else:
                 result = None
-        conn.commit()
+        _DB_CONN.commit()
         return result
     except Exception:
-        conn.rollback()
+        _DB_CONN.rollback()
         raise
-    finally:
-        conn.close()
+
+
+def db_close():
+    global _DB_CONN
+    if _DB_CONN is not None and not _DB_CONN.closed:
+        _DB_CONN.close()
+    _DB_CONN = None
 
 
 def ensure_schema():
@@ -568,6 +578,84 @@ def temperature_probability(member_highs, market):
     return 100.0 * hits / len(member_highs)
 
 
+def rain_probability(member_precip_totals):
+    """Probability proxy for KXRAIN: total daily precipitation > 0 inches."""
+    if not member_precip_totals:
+        return None
+    hits = sum(value > 0.0 for value in member_precip_totals)
+    return 100.0 * hits / len(member_precip_totals)
+
+
+def rain_city_from_ticker(market):
+    ticker = (market.get("ticker") or "").upper()
+    if not ticker.startswith("KXRAIN-"):
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return None
+    code = parts[-1]
+    return code if code in LOCATION_MAP else None
+
+
+def prior_rain_member_data(city, date_key):
+    row = latest_forecast(city, "ensemble_rain_distribution", ENSEMBLE_MODEL, date_key)
+    return (row[2] or {}) if row else None
+
+
+def build_rain_candidate(city, date_key, market, current_probability, previous_probability):
+    if current_probability is None or previous_probability is None:
+        return None
+
+    probability_change = current_probability - previous_probability
+    if abs(probability_change) < MIN_FORECAST_PROBABILITY_CHANGE_POINTS:
+        return None
+
+    ticker = market.get("ticker") or ""
+    previous_market = latest_market(ticker)
+    if not previous_market:
+        return None
+
+    best = None
+    for side in ("YES", "NO"):
+        ask = get_side_ask_cents(market, side)
+        if ask is None or not (MIN_ENTRY_PRICE_CENTS <= ask <= MAX_ENTRY_PRICE_CENTS):
+            continue
+
+        side_probability = current_probability if side == "YES" else 100.0 - current_probability
+        side_probability_change = probability_change if side == "YES" else -probability_change
+        previous_ask = safe_float(previous_market[2] if side == "YES" else previous_market[4])
+        if previous_ask is None:
+            continue
+
+        market_change = ask - previous_ask
+        market_lag = side_probability_change - market_change
+        preliminary_edge = side_probability - ask
+
+        if market_lag < MIN_MARKET_LAG_POINTS:
+            continue
+        if preliminary_edge < MIN_PRELIMINARY_EDGE_POINTS:
+            continue
+
+        candidate = {
+            "city": city,
+            "forecast_date": date_key,
+            "market_ticker": ticker,
+            "market_kind": "precipitation",
+            "side": side,
+            "entry_price_cents": ask,
+            "model_probability_proxy": side_probability,
+            "preliminary_edge_points": preliminary_edge,
+            "forecast_probability_change_points": side_probability_change,
+            "market_price_change_points": market_change,
+            "market_lag_points": market_lag,
+            "forecast_temperature_change_f": None,
+            "contract_label": market.get("title") or "",
+        }
+        if best is None or (candidate["market_lag_points"], candidate["preliminary_edge_points"]) > (best["market_lag_points"], best["preliminary_edge_points"]):
+            best = candidate
+    return best
+
+
 def get_side_ask_cents(market, side):
     field = "yes_ask_dollars" if side == "YES" else "no_ask_dollars"
     value = safe_float(market.get(field))
@@ -734,8 +822,9 @@ def send_discord(message):
 
 
 def signal_message(signal):
+    kind_label = "PRECIPITATION" if signal.get("market_kind") == "precipitation" else "TEMPERATURE"
     return (
-        "🌦️ **WEATHER FORECAST SHOCK — PAPER TRADE**\n\n"
+        f"🌦️ **{kind_label} FORECAST SHOCK — PAPER TRADE**\n\n"
         f"**{signal['city']} — {signal['forecast_date']}**\n"
         f"Market: `{signal['market_ticker']}`\n"
         f"Side: **{signal['side']}**\n"
@@ -746,8 +835,8 @@ def signal_message(signal):
         f"Estimated market lag: **{signal['market_lag_points']:+.1f} pts**\n"
         f"Preliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\n"
         f"Paper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n"
-        "⚠️ Research only. The ensemble value is an uncalibrated frequency proxy; "
-        "Kalshi settlement source/location must still be verified per market."
+        "⚠️ Research only. The ensemble value is an uncalibrated frequency proxy. "
+        "For precipitation, Kalshi settles using the official Weather Company data, so Open-Meteo is a forecast proxy, not the settlement feed."
     )
 
 
@@ -1029,7 +1118,74 @@ def process_temperature_signals(temp_series, ensemble, stats):
             )
 
 
-def collect_market_snapshots(temp_series, stats):
+def process_rain_signals(city_names, ensemble, stats):
+    """Evaluate KXRAIN daily >0.00 inch outcomes for forecast shocks."""
+    markets_by_city = defaultdict(list)
+    for market in get_series_markets("KXRAIN"):
+        code = rain_city_from_ticker(market)
+        if code in city_names:
+            markets_by_city[code].append(market)
+
+    for code in city_names:
+        if code not in RAIN_SIGNAL_CODES:
+            continue
+        location = LOCATION_MAP[code]
+        city, _, _, tz_name, _ = location
+        for market in markets_by_city.get(code, []):
+            date_key = parse_market_date(market)
+            if not date_key:
+                continue
+            if date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
+                continue
+
+            current_daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+            if not current_daily:
+                continue
+            current_members = current_daily.get("member_precip_totals") or []
+            previous = prior_rain_member_data(city, date_key)
+            previous_members = (previous or {}).get("member_precip_totals") or []
+            if not previous_members:
+                continue
+
+            current_prob = rain_probability(current_members)
+            previous_prob = rain_probability(previous_members)
+            signal = build_rain_candidate(city, date_key, market, current_prob, previous_prob)
+            if not signal:
+                continue
+
+            stats["forecast_shocks"] += 1
+            stats["rain_forecast_shocks"] += 1
+            reason = {
+                "contract": market.get("title") or market.get("ticker"),
+                "market_kind": "precipitation",
+                "rain_rule": "YES if total daily precipitation is strictly greater than 0 inches; trace and missing daily values count as 0.",
+                "ensemble_model": ENSEMBLE_MODEL,
+                "current_member_count": len(current_members),
+                "previous_member_count": len(previous_members),
+                "current_precip_mean_inches": statistics.mean(current_members),
+                "previous_precip_mean_inches": statistics.mean(previous_members),
+                "settlement_source_note": "Kalshi weather rules use the official Weather Company source; Open-Meteo is a forecast proxy and is not settlement-equivalent.",
+            }
+            fp, created = open_paper_trade(signal, reason)
+            if not created:
+                continue
+            stats["paper_trades_created"] += 1
+
+            if not db_execute("SELECT 1 FROM alert_log WHERE fingerprint=%s", (fp,), fetchone=True):
+                if send_discord(signal_message(signal)):
+                    record_alert(fp, signal)
+                    stats["discord_alerts"] += 1
+                else:
+                    log.error("Paper trade %s created but Discord alert failed", fp)
+
+            log.info(
+                "RAIN FORECAST SHOCK | %s | %s | %s | prob %.1f -> %.1f | market lag %.1f pts | edge %.1f pts",
+                city, date_key, market.get("ticker"), previous_prob, current_prob,
+                signal["market_lag_points"], signal["preliminary_edge_points"],
+            )
+
+
+def collect_market_snapshots(temp_series, stats, city_names):
     for series in temp_series:
         location = location_from_title_or_ticker(series)
         if location is None:
@@ -1039,6 +1195,14 @@ def collect_market_snapshots(temp_series, stats):
         stats["temperature_markets"] += len(markets)
         for market in markets:
             insert_market_snapshot(market, city, "temperature")
+
+    for market in get_series_markets("KXRAIN"):
+        code = rain_city_from_ticker(market)
+        if not code or code not in city_names:
+            continue
+        city = LOCATION_MAP[code][0]
+        stats["rain_markets"] += 1
+        insert_market_snapshot(market, city, "precipitation")
 
 
 def run_scan():
@@ -1053,7 +1217,9 @@ def run_scan():
         "settled_trades": 0,
         "deterministic_gfs_ok": False,
         "ensemble_ok": False,
-        "rain_signals_enabled": False,
+        "rain_signals_enabled": True,
+        "rain_markets": 0,
+        "rain_forecast_shocks": 0,
     }
     started = time.time()
 
@@ -1107,13 +1273,14 @@ def run_scan():
 
             # Important: compare against the previous forecast BEFORE saving the new baseline.
             process_temperature_signals(temp_series, ensemble, stats)
+            process_rain_signals(city_names, ensemble, stats)
 
             save_weather_forecasts(deterministic, ensemble)
         else:
             ensemble = {}
 
         # Market snapshots happen every scan, including scans without a new weather run.
-        collect_market_snapshots(temp_series, stats)
+        collect_market_snapshots(temp_series, stats, city_names)
         stats["settled_trades"] += settle_paper_trades()
         finish_scan_run(scan_id, "success", stats)
         log.info("SCAN COMPLETE | %s | runtime=%.1fs", json.dumps(stats, default=str), time.time() - started)
@@ -1125,6 +1292,8 @@ def run_scan():
             except Exception:
                 log.exception("Could not record scan failure")
         raise
+    finally:
+        db_close()
 
 
 if __name__ == "__main__":
