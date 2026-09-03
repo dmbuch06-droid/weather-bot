@@ -1128,7 +1128,7 @@ def record_research_event(city, date_key, variable, market, side, previous_proba
     initial_market_change = current_market_ask - previous_market_ask
     initial_lag = side_forecast_change - initial_market_change
     initial_edge = side_probability - current_market_ask
-    status = "open" if initial_lag > 0 else "no_initial_lag"
+    status = "open"
     fp = research_event_fingerprint(city, date_key, variable, ticker, side, forecast_signature)
 
     row = db_execute(
@@ -1166,20 +1166,37 @@ def record_research_temperature(temp_series, ensemble, stats):
         if location is None:
             continue
         city, _, _, tz_name, _ = location
-        for market in get_series_markets(series.get("ticker")):
+        markets = get_series_markets(series.get("ticker"))
+        for market in markets:
+            stats["research_markets_considered"] += 2
             date_key = parse_market_date(market)
-            if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
+            if not date_key:
+                continue
+            if date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
                 continue
             daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+            if daily:
+                stats["research_current_forecasts"] += 1
+            else:
+                stats["research_missing_current_forecast"] += 1
+                continue
             previous = prior_member_data(city, date_key, "ensemble_temperature_distribution")
-            if not daily or not previous:
+            if previous:
+                stats["research_previous_forecasts"] += 1
+            else:
+                stats["research_missing_previous_forecast"] += 1
                 continue
             current_members = daily.get("member_highs") or []
             previous_members = previous.get("member_highs") or []
             if not current_members or not previous_members:
+                stats["research_invalid_probability_pairs"] += 2
                 continue
             current_prob = temperature_probability(current_members, market)
             previous_prob = temperature_probability(previous_members, market)
+            if current_prob is None or previous_prob is None:
+                stats["research_invalid_probability_pairs"] += 2
+                continue
+            stats["research_probability_pairs"] += 2
             prev_market = latest_market(market.get("ticker") or "")
             for side in ("YES", "NO"):
                 current_ask = get_side_ask_cents(market, side)
@@ -1196,16 +1213,30 @@ def record_research_rain(city_names, ensemble, stats):
         date_key = parse_market_date(market)
         if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
             continue
+        stats["research_markets_considered"] += 2
         daily = ensemble.get(city, {}).get("daily", {}).get(date_key)
+        if daily:
+            stats["research_current_forecasts"] += 1
+        else:
+            stats["research_missing_current_forecast"] += 1
+            continue
         previous = prior_rain_member_data(city, date_key)
-        if not daily or not previous:
+        if previous:
+            stats["research_previous_forecasts"] += 1
+        else:
+            stats["research_missing_previous_forecast"] += 1
             continue
         current_members = daily.get("member_precip_totals") or []
         previous_members = previous.get("member_precip_totals") or []
         if not current_members or not previous_members:
+            stats["research_invalid_probability_pairs"] += 2
             continue
         current_prob = rain_probability(current_members)
         previous_prob = rain_probability(previous_members)
+        if current_prob is None or previous_prob is None:
+            stats["research_invalid_probability_pairs"] += 2
+            continue
+        stats["research_probability_pairs"] += 2
         prev_market = latest_market(market.get("ticker") or "")
         for side in ("YES", "NO"):
             current_ask = get_side_ask_cents(market, side)
@@ -1213,46 +1244,54 @@ def record_research_rain(city_names, ensemble, stats):
             record_research_event(city, date_key, "precipitation", market, side, previous_prob, current_prob, previous_ask, current_ask, payload_hash({"member_precip_totals": current_members}), stats)
 
 
-def research_observe_market_progress(stats):
+def research_observe_market_progress(stats, scan_started_at):
     rows = db_execute(
         """
         SELECT id,city,forecast_date,variable,market_ticker,side,created_at,event_ask_cents,
                initial_market_lag_points,first_response_at,milestone_25_at,milestone_50_at,
-               milestone_75_at,milestone_90_at,max_market_move_points
+               milestone_75_at,milestone_90_at,max_market_move_points,latest_observation_at
         FROM forecast_research_events
         WHERE status='open'
+          AND created_at < %s
         ORDER BY created_at ASC
         LIMIT 1000
         """,
+        (scan_started_at,),
         fetch=True,
     ) or []
     for row in rows:
         (event_id, city, forecast_date, variable, ticker, side, created_at, event_ask,
-         initial_lag, first_response_at, m25, m50, m75, m90, max_move) = row
-        if initial_lag is None or initial_lag <= 0 or event_ask is None:
+         initial_lag, first_response_at, m25, m50, m75, m90, max_move, latest_observed_at) = row
+        if initial_lag is None or event_ask is None:
             continue
+        after = latest_observed_at or created_at
         snapshot = db_execute(
             """
             SELECT observed_at,
                    CASE WHEN %s='YES' THEN yes_ask_cents ELSE no_ask_cents END
             FROM market_snapshots
-            WHERE ticker=%s AND observed_at>%s
-            ORDER BY observed_at DESC
+            WHERE ticker=%s AND observed_at>%s AND observed_at<%s
+            ORDER BY observed_at ASC
             LIMIT 1
             """,
-            (side, ticker, created_at), fetchone=True,
+            (side, ticker, after, scan_started_at), fetchone=True,
         )
         if not snapshot or snapshot[1] is None:
             continue
         observed_at, current_ask = snapshot
         market_move = current_ask - event_ask
-        response_fraction = market_move / initial_lag if initial_lag else 0.0
+        # Measure response in the forecast-change direction. Initial lag may be
+        # zero/negative; such events remain in the research table but do not
+        # get milestone timing until a positive initial gap exists.
+        response_fraction = (market_move / initial_lag) if initial_lag > 0 else 0.0
         lag_remaining = initial_lag - market_move
         max_move_new = max(max_move or 0.0, market_move)
         db_execute(
             """
-            INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction)
-            VALUES(%s,%s,%s,%s,%s,%s)
+            INSERT INTO forecast_research_updates(
+                event_id,observed_at,market_ask_cents,market_move_points,
+                lag_remaining_points,market_response_fraction
+            ) VALUES(%s,%s,%s,%s,%s,%s)
             """,
             (event_id, observed_at, current_ask, market_move, lag_remaining, response_fraction),
         )
@@ -1263,13 +1302,24 @@ def research_observe_market_progress(stats):
             "latest_lag_remaining_points": lag_remaining,
             "max_market_move_points": max_move_new,
         }
+        # First response is directional: a YES event responds when YES ask rises;
+        # a NO event responds when NO ask rises.
         if first_response_at is None and market_move > 0:
             updates["first_response_at"] = observed_at
-        for fraction, column, existing in ((0.25, "milestone_25_at", m25),(0.50, "milestone_50_at", m50),(0.75, "milestone_75_at", m75),(0.90, "milestone_90_at", m90)):
-            if existing is None and market_move >= initial_lag * fraction:
-                updates[column] = observed_at
-                if fraction == 0.90:
-                    log.info("RESEARCH ADAPTED 90%% | %s | %s | %s | %.1fs", variable, city, ticker, (observed_at-created_at).total_seconds())
+        if initial_lag > 0:
+            for fraction, column, existing in (
+                (0.25, "milestone_25_at", m25),
+                (0.50, "milestone_50_at", m50),
+                (0.75, "milestone_75_at", m75),
+                (0.90, "milestone_90_at", m90),
+            ):
+                if existing is None and market_move >= initial_lag * fraction:
+                    updates[column] = observed_at
+                    if fraction == 0.90:
+                        log.info(
+                            "RESEARCH ADAPTED 90%% | %s | %s | %s | %.1fs",
+                            variable, city, ticker, (observed_at-created_at).total_seconds()
+                        )
         assignments = [f"{k}=%s" for k in updates]
         db_execute(
             f"UPDATE forecast_research_events SET {', '.join(assignments)} WHERE id=%s",
@@ -1453,8 +1503,16 @@ def run_scan():
         "research_probability_changes": 0,
         "research_market_price_pairs": 0,
         "research_events_no_market_history": 0,
+        "research_markets_considered": 0,
+        "research_current_forecasts": 0,
+        "research_previous_forecasts": 0,
+        "research_probability_pairs": 0,
+        "research_missing_previous_forecast": 0,
+        "research_missing_current_forecast": 0,
+        "research_invalid_probability_pairs": 0,
     }
     started = time.time()
+    scan_started_at = utc_now()
 
     log.info("=" * 50)
     log.info("STARTING WEATHER MARKET SCAN")
@@ -1516,7 +1574,7 @@ def run_scan():
 
         # Market snapshots happen every scan, including scans without a new weather run.
         collect_market_snapshots(temp_series, stats, city_names)
-        research_observe_market_progress(stats)
+        research_observe_market_progress(stats, scan_started_at)
         stats["settled_trades"] += settle_paper_trades()
         finish_scan_run(scan_id, "success", stats)
         log.info(
@@ -1528,6 +1586,16 @@ def run_scan():
             stats["research_events_no_market_history"],
             stats["research_events_created"],
             stats["research_events_observed"],
+        )
+        log.info(
+            "RESEARCH DETAIL | markets_considered=%d | current_forecasts=%d | previous_forecasts=%d | probability_pairs=%d | missing_previous_forecast=%d | missing_current_forecast=%d | invalid_probability_pairs=%d",
+            stats["research_markets_considered"],
+            stats["research_current_forecasts"],
+            stats["research_previous_forecasts"],
+            stats["research_probability_pairs"],
+            stats["research_missing_previous_forecast"],
+            stats["research_missing_current_forecast"],
+            stats["research_invalid_probability_pairs"],
         )
         log.info("SCAN COMPLETE | %s | runtime=%.1fs", json.dumps(stats, default=str), time.time() - started)
     except Exception as exc:
