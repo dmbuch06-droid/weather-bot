@@ -314,7 +314,7 @@ def location_from_title_or_ticker(series):
 
 def temperature_series(series):
     title = (series.get("title") or "").lower()
-    tags = " ".join(str(x).lower() for x in series.get("tags", []))
+    tags = " ".join(str(x).lower() for x in (series.get("tags") or []))
     text = title + " " + tags
     return (
         series.get("frequency") == "daily"
