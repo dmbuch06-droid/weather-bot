@@ -413,7 +413,7 @@ def http_json(url, params=None):
         url,
         params=params,
         headers={
-            "User-Agent": "WeatherKalshiResearchBot/5.0",
+            "User-Agent": "WeatherKalshiResearchBot/6.0",
             "Accept": "application/json",
         },
         timeout=REQUEST_TIMEOUT,
@@ -444,23 +444,29 @@ def nws_json(url):
 
 
 def fetch_nws_updates(city_names):
-    """Return each city's current NWS forecast update timestamp.
+    """Return the issuance/update timestamp of each city's NWS grid forecast.
 
-    We use NWS only as the publication/update trigger and provenance reference.
-    GFS ensemble remains the probability source used by the existing strategy.
+    The NWS /points endpoint supplies the current WFO/grid mapping. The
+    forecastGridData product is the raw NDFD forecast product, so its
+    ``updateTime`` is a better version marker than the derived hourly
+    forecast endpoint. We use NWS only as the publication trigger/provenance;
+    the existing GFS ensemble remains the probability source for the strategy.
     """
     updates = {}
     for code in city_names:
         _, lat, lon, _, _ = LOCATION_MAP[code]
         point = nws_json(f"{NWS_API_URL}/points/{lat},{lon}")
-        forecast_url = (point.get("properties") or {}).get("forecastHourly")
-        if not forecast_url:
-            raise RuntimeError(f"NWS: no hourly forecast URL for {code}")
-        forecast = nws_json(forecast_url)
-        properties = forecast.get("properties") or {}
-        updated = properties.get("updated") or properties.get("updateTime")
+        properties = point.get("properties") or {}
+        grid_url = properties.get("forecastGridData")
+        if not grid_url:
+            raise RuntimeError(f"NWS: no forecastGridData URL for {code}")
+
+        grid = nws_json(grid_url)
+        grid_properties = grid.get("properties") or {}
+        updated = grid_properties.get("updateTime") or grid_properties.get("updated")
         if not updated:
-            raise RuntimeError(f"NWS: no update timestamp for {code}")
+            raise RuntimeError(f"NWS: no grid forecast update timestamp for {code}")
+
         dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -927,7 +933,7 @@ def send_discord(message):
         response = requests.post(
             DISCORD_RELAY_URL,
             json={"secret": DISCORD_RELAY_SECRET, "message": message},
-            headers={"User-Agent": "WeatherKalshiResearchBot/5.0", "Accept": "application/json"},
+            headers={"User-Agent": "WeatherKalshiResearchBot/6.0", "Accept": "application/json"},
             timeout=REQUEST_TIMEOUT,
         )
         log.info("Discord relay response: %s", response.status_code)
@@ -1606,6 +1612,8 @@ def run_scan():
 
         refresh_weather = bool(changed_updates)
         log.info("New NWS forecast detected: %s", refresh_weather)
+        if changed_updates:
+            log.info("NWS update cities: %s", ", ".join(sorted(changed_updates)))
 
         if refresh_weather:
             stats["weather_refreshed"] = True
