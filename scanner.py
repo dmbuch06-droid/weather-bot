@@ -426,51 +426,76 @@ def http_json(url, params=None):
         raise RuntimeError("API returned invalid JSON") from exc
 
 
-def nws_json(url):
-    response = requests.get(
-        url,
-        headers={
-            "User-Agent": NWS_USER_AGENT,
-            "Accept": "application/geo+json, application/ld+json, application/json",
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not 200 <= response.status_code < 300:
-        raise RuntimeError(f"NWS {response.status_code}: {response.text[:500]}")
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise RuntimeError("NWS API returned invalid JSON") from exc
+def nws_json(url, timeout_seconds=None, attempts=2):
+    """Fetch an NWS JSON resource with bounded retries for transient failures."""
+    timeout_value = timeout_seconds if timeout_seconds is not None else min(REQUEST_TIMEOUT, 12)
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": NWS_USER_AGENT,
+                    "Accept": "application/geo+json, application/ld+json, application/json",
+                },
+                timeout=timeout_value,
+            )
+            if 200 <= response.status_code < 300:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    raise RuntimeError("NWS API returned invalid JSON") from exc
+            if response.status_code in {408, 429, 500, 502, 503, 504} and attempt < attempts:
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(f"NWS {response.status_code}: {response.text[:500]}")
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(f"NWS request failed: {exc}") from exc
+    raise RuntimeError(f"NWS request failed: {last_exc}")
 
 
 def fetch_nws_updates(city_names):
-    """Return the issuance/update timestamp of each city's NWS grid forecast.
+    """Return successful NWS grid forecast update timestamps keyed by city code.
 
     The NWS /points endpoint supplies the current WFO/grid mapping. The
     forecastGridData product is the raw NDFD forecast product, so its
-    ``updateTime`` is a better version marker than the derived hourly
-    forecast endpoint. We use NWS only as the publication trigger/provenance;
-    the existing GFS ensemble remains the probability source for the strategy.
+    ``updateTime`` is the version marker. NWS availability is treated as a
+    per-city dependency: a temporary timeout for one city must not stop the
+    scanner from checking Kalshi or processing another city's fresh update.
     """
     updates = {}
+    failures = {}
     for code in city_names:
         _, lat, lon, _, _ = LOCATION_MAP[code]
-        point = nws_json(f"{NWS_API_URL}/points/{lat},{lon}")
-        properties = point.get("properties") or {}
-        grid_url = properties.get("forecastGridData")
-        if not grid_url:
-            raise RuntimeError(f"NWS: no forecastGridData URL for {code}")
+        try:
+            point = nws_json(f"{NWS_API_URL}/points/{lat},{lon}")
+            properties = point.get("properties") or {}
+            grid_url = properties.get("forecastGridData")
+            if not grid_url:
+                raise RuntimeError(f"NWS: no forecastGridData URL for {code}")
 
-        grid = nws_json(grid_url)
-        grid_properties = grid.get("properties") or {}
-        updated = grid_properties.get("updateTime") or grid_properties.get("updated")
-        if not updated:
-            raise RuntimeError(f"NWS: no grid forecast update timestamp for {code}")
+            grid = nws_json(grid_url)
+            grid_properties = grid.get("properties") or {}
+            updated = grid_properties.get("updateTime") or grid_properties.get("updated")
+            if not updated:
+                raise RuntimeError(f"NWS: no grid forecast update timestamp for {code}")
 
-        dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        updates[code] = dt.astimezone(timezone.utc)
+            dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            updates[code] = dt.astimezone(timezone.utc)
+        except Exception as exc:
+            failures[code] = str(exc)
+            log.warning("NWS update check failed for %s; keeping last known state: %s", code, exc)
+
+    if failures:
+        log.warning("NWS update check completed with %d/%d city failures", len(failures), len(city_names))
+    if not updates:
+        raise RuntimeError("NWS update check failed for every monitored city")
     return updates
 
 
@@ -1605,10 +1630,19 @@ def run_scan():
         try:
             nws_updates, changed_updates = detect_nws_updates(city_names)
             stats["nws_updates_detected"] = len(changed_updates)
-            for code, updated_at in nws_updates.items():
+            for code in city_names:
+                updated_at = nws_updates.get(code)
+                if updated_at is None:
+                    log.info("NWS %s forecast update: unavailable this scan", code)
+                    continue
                 log.info("NWS %s forecast update: %s%s", code, updated_at.isoformat(), " (NEW)" if code in changed_updates else "")
         except Exception as exc:
-            raise RuntimeError(f"NWS update check failed: {exc}") from exc
+            # NWS is the refresh trigger, not a reason to stop market monitoring.
+            # If NWS is temporarily unavailable everywhere, continue the scan and
+            # let the next five-minute run try again.
+            log.warning("NWS update check unavailable this scan; continuing market monitoring: %s", exc)
+            nws_updates = {}
+            changed_updates = {}
 
         refresh_weather = bool(changed_updates)
         log.info("New NWS forecast detected: %s", refresh_weather)
