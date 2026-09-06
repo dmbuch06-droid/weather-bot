@@ -1,15 +1,8 @@
-import hashlib
-import json
-import logging
-import os
-import statistics
-import time
+import hashlib, json, logging, math, os, re, statistics, time
 from collections import defaultdict
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-
 import requests
-
 try:
     import psycopg2
     from psycopg2.extras import Json
@@ -17,1688 +10,388 @@ except ImportError:
     psycopg2 = None
     Json = None
 
-KALSHI_API_URL = os.environ.get(
-    "KALSHI_API_URL",
-    "https://external-api.kalshi.com/trade-api/v2",
-).rstrip("/")
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-DISCORD_RELAY_URL = os.environ.get("DISCORD_RELAY_URL", "").strip()
-DISCORD_RELAY_SECRET = os.environ.get("DISCORD_RELAY_SECRET", "").strip()
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
-NWS_API_URL = "https://api.weather.gov"
-NWS_USER_AGENT = os.environ.get("NWS_USER_AGENT", "WeatherKalshiResearchBot/1.0")
-FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
-MIN_FORECAST_PROBABILITY_CHANGE_POINTS = float(
-    os.environ.get("MIN_FORECAST_PROBABILITY_CHANGE_POINTS", "20")
-)
-MIN_MARKET_LAG_POINTS = float(os.environ.get("MIN_MARKET_LAG_POINTS", "10"))
-MIN_PRELIMINARY_EDGE_POINTS = float(
-    os.environ.get("MIN_PRELIMINARY_EDGE_POINTS", "10")
-)
-MIN_ENTRY_PRICE_CENTS = float(os.environ.get("MIN_ENTRY_PRICE_CENTS", "5"))
-MAX_ENTRY_PRICE_CENTS = float(os.environ.get("MAX_ENTRY_PRICE_CENTS", "95"))
-PAPER_RISK_DOLLARS = float(os.environ.get("PAPER_RISK_DOLLARS", "10"))
-RESEARCH_MIN_FORECAST_CHANGE_POINTS = float(os.environ.get("RESEARCH_MIN_FORECAST_CHANGE_POINTS", "3"))
-RAIN_SIGNAL_CODES = {"NYC", "CHI", "MIA", "AUS"}
+KALSHI_API_URL=os.environ.get('KALSHI_API_URL','https://external-api.kalshi.com/trade-api/v2').rstrip('/')
+DATABASE_URL=os.environ.get('DATABASE_URL','').strip()
+DISCORD_RELAY_URL=os.environ.get('DISCORD_RELAY_URL','').strip()
+DISCORD_RELAY_SECRET=os.environ.get('DISCORD_RELAY_SECRET','').strip()
+REQUEST_TIMEOUT=int(os.environ.get('REQUEST_TIMEOUT','20'))
+FORECAST_DAYS=int(os.environ.get('FORECAST_DAYS','3'))
+NWS_API_URL='https://api.weather.gov'
+NWS_USER_AGENT=os.environ.get('NWS_USER_AGENT','WeatherKalshiResearchBot/7.0')
+GEOCODING_API_URL='https://geocoding-api.open-meteo.com/v1/search'
+ENSEMBLE_MODEL='gfs_seamless'; DETERMINISTIC_MODEL='gfs_seamless'
+SCHEMA_VERSION=7; MEASUREMENT_VERSION='v7_clean_baseline'
+MIN_FORECAST_PROBABILITY_CHANGE_POINTS=float(os.environ.get('MIN_FORECAST_PROBABILITY_CHANGE_POINTS','20'))
+MIN_MARKET_LAG_POINTS=float(os.environ.get('MIN_MARKET_LAG_POINTS','10'))
+MIN_PRELIMINARY_EDGE_POINTS=float(os.environ.get('MIN_PRELIMINARY_EDGE_POINTS','10'))
+MIN_ENTRY_PRICE_CENTS=float(os.environ.get('MIN_ENTRY_PRICE_CENTS','5'))
+MAX_ENTRY_PRICE_CENTS=float(os.environ.get('MAX_ENTRY_PRICE_CENTS','95'))
+PAPER_RISK_DOLLARS=float(os.environ.get('PAPER_RISK_DOLLARS','10'))
+RESEARCH_MIN_FORECAST_CHANGE_POINTS=float(os.environ.get('RESEARCH_MIN_FORECAST_CHANGE_POINTS','3'))
+ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGNALS','false').lower() in {'1','true','yes'}
+KNOWN={'NYC':('New York City',40.7789,-73.9692,'America/New_York',True),'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',False),'MIA':('Miami',25.7959,-80.2870,'America/New_York',False),'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False)}
+logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('weather-kalshi-scanner'); _DB_CONN=None
 
-_DB_CONN = None
+def now(): return datetime.now(timezone.utc)
+def f(v,d=None):
+    try:return float(v) if v is not None else d
+    except:return d
+def h(x): return hashlib.sha256(json.dumps(x,sort_keys=True,separators=(',',':'),default=str).encode()).hexdigest()
+def slug(s): return re.sub(r'[^A-Z0-9]+','_',s.upper()).strip('_')[:48] or 'UNKNOWN'
+def local_date(ts,tz): return datetime.fromisoformat(str(ts).replace('Z','+00:00')).astimezone(ZoneInfo(tz)).date().isoformat()
+def round_temp(v):
+    v=f(v); return None if v is None else int(math.floor(v+0.5))
 
-# We deliberately do NOT enable automatic signals for unverified settlement
-# locations. All four cities are monitored; only verified entries can signal.
-ALLOW_UNVERIFIED_LOCATION_SIGNALS = os.environ.get(
-    "ALLOW_UNVERIFIED_LOCATION_SIGNALS", "false"
-).lower() in {"1", "true", "yes"}
-
-# The forecast-shock probability source is the GFS ensemble. Deterministic
-# GFS is used only as a diagnostic. HRRR/NBM are deliberately optional and
-# are not allowed to make a scan fail.
-ENSEMBLE_MODEL = "gfs_seamless"
-DETERMINISTIC_MODEL = "gfs_seamless"
-
-LOCATION_MAP = {
-    "NYC": ("New York City", 40.7789, -73.9692, "America/New_York", True),
-    "CHI": ("Chicago", 41.9742, -87.9073, "America/Chicago", False),
-    "MIA": ("Miami", 25.7959, -80.2870, "America/New_York", False),
-    "AUS": ("Austin", 30.1975, -97.6663, "America/Chicago", False),
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("weather-kalshi-scanner")
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def safe_float(value, default=None):
-    try:
-        return float(value) if value is not None else default
-    except (TypeError, ValueError):
-        return default
-
-
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured")
-    if psycopg2 is None:
-        raise RuntimeError("psycopg2-binary is not installed")
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
-
-
-def db_execute(sql, params=None, fetch=False, fetchone=False):
+def db():
+    if not DATABASE_URL: raise RuntimeError('DATABASE_URL is not configured')
+    if psycopg2 is None: raise RuntimeError('psycopg2-binary is not installed')
+    return psycopg2.connect(DATABASE_URL,connect_timeout=10)
+def q(sql,p=(),fetch=False,one=False):
     global _DB_CONN
-    if _DB_CONN is None or _DB_CONN.closed:
-        _DB_CONN = db_conn()
+    if _DB_CONN is None or _DB_CONN.closed:_DB_CONN=db()
     try:
-        with _DB_CONN.cursor() as cur:
-            cur.execute(sql, params or ())
-            if fetchone:
-                result = cur.fetchone()
-            elif fetch:
-                result = cur.fetchall()
-            else:
-                result = None
-        _DB_CONN.commit()
-        return result
+        with _DB_CONN.cursor() as c:
+            c.execute(sql,p); r=c.fetchone() if one else (c.fetchall() if fetch else None)
+        _DB_CONN.commit(); return r
     except Exception:
-        _DB_CONN.rollback()
-        raise
-
-
-def db_close():
+        _DB_CONN.rollback(); raise
+def close_db():
     global _DB_CONN
-    if _DB_CONN is not None and not _DB_CONN.closed:
-        _DB_CONN.close()
-    _DB_CONN = None
+    if _DB_CONN is not None and not _DB_CONN.closed:_DB_CONN.close()
+    _DB_CONN=None
 
+def http(url,params=None,headers=None,tries=2):
+    last=None
+    for i in range(tries):
+        try:
+            r=requests.get(url,params=params,headers=headers or {'User-Agent':'WeatherKalshiResearchBot/7.0','Accept':'application/json'},timeout=REQUEST_TIMEOUT)
+            if r.status_code==200:return r.json()
+            if r.status_code in {408,429,500,502,503,504} and i+1<tries:time.sleep(1);continue
+            raise RuntimeError(f'HTTP {r.status_code}: {r.text[:800]}')
+        except requests.RequestException as e:
+            last=e
+            if i+1<tries:time.sleep(1);continue
+    raise RuntimeError(f'HTTP request failed: {last}')
+def nws(url): return http(url,headers={'User-Agent':NWS_USER_AGENT,'Accept':'application/geo+json,application/json'})
 
-def ensure_schema():
-    statements = [
-        """
-        CREATE TABLE IF NOT EXISTS scan_runs (
-            id BIGSERIAL PRIMARY KEY,
-            started_at TIMESTAMPTZ NOT NULL,
-            completed_at TIMESTAMPTZ,
-            status TEXT NOT NULL,
-            stats JSONB NOT NULL DEFAULT '{}'::jsonb,
-            error TEXT
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS series_registry (
-            series_ticker TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            category TEXT,
-            tags JSONB NOT NULL,
-            settlement_sources JSONB NOT NULL,
-            contract_terms_url TEXT,
-            updated_at TIMESTAMPTZ NOT NULL,
-            raw_series JSONB NOT NULL
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS weather_service_state (
-            city_code TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            last_update_at TIMESTAMPTZ NOT NULL,
-            checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS forecast_observations (
-            id BIGSERIAL PRIMARY KEY,
-            observed_at TIMESTAMPTZ NOT NULL,
-            city TEXT NOT NULL,
-            variable TEXT NOT NULL,
-            model TEXT NOT NULL,
-            forecast_date DATE NOT NULL,
-            scalar_value DOUBLE PRECISION,
-            payload JSONB NOT NULL,
-            payload_hash TEXT NOT NULL,
-            UNIQUE(city, variable, model, forecast_date, payload_hash)
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_forecast_lookup
-        ON forecast_observations(city, variable, model, forecast_date, observed_at DESC)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS market_snapshots (
-            id BIGSERIAL PRIMARY KEY,
-            observed_at TIMESTAMPTZ NOT NULL,
-            ticker TEXT NOT NULL,
-            event_ticker TEXT,
-            series_ticker TEXT,
-            market_date DATE,
-            city TEXT,
-            market_kind TEXT NOT NULL,
-            strike_type TEXT,
-            floor_strike DOUBLE PRECISION,
-            cap_strike DOUBLE PRECISION,
-            yes_bid_cents DOUBLE PRECISION,
-            yes_ask_cents DOUBLE PRECISION,
-            no_bid_cents DOUBLE PRECISION,
-            no_ask_cents DOUBLE PRECISION,
-            last_price_cents DOUBLE PRECISION,
-            status TEXT,
-            result TEXT
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_market_lookup
-        ON market_snapshots(ticker, observed_at DESC)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS paper_trades (
-            id BIGSERIAL PRIMARY KEY,
-            signal_fingerprint TEXT UNIQUE NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL,
-            settled_at TIMESTAMPTZ,
-            city TEXT NOT NULL,
-            forecast_date DATE NOT NULL,
-            market_ticker TEXT NOT NULL,
-            market_kind TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry_price_cents DOUBLE PRECISION NOT NULL,
-            stake_dollars DOUBLE PRECISION NOT NULL,
-            contracts DOUBLE PRECISION NOT NULL,
-            model_probability_proxy DOUBLE PRECISION NOT NULL,
-            preliminary_edge_points DOUBLE PRECISION NOT NULL,
-            forecast_probability_change_points DOUBLE PRECISION NOT NULL,
-            market_price_change_points DOUBLE PRECISION NOT NULL,
-            market_lag_points DOUBLE PRECISION NOT NULL,
-            forecast_temperature_change_f DOUBLE PRECISION,
-            reason JSONB NOT NULL,
-            result TEXT,
-            profit_loss_dollars DOUBLE PRECISION,
-            status TEXT NOT NULL DEFAULT 'open'
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_paper_status
-        ON paper_trades(status, created_at DESC)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS alert_log (
-            fingerprint TEXT PRIMARY KEY,
-            sent_at TIMESTAMPTZ NOT NULL,
-            payload JSONB NOT NULL
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS forecast_research_events (
-            id BIGSERIAL PRIMARY KEY,
-            event_fingerprint TEXT UNIQUE NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL,
-            city TEXT NOT NULL,
-            forecast_date DATE NOT NULL,
-            variable TEXT NOT NULL,
-            market_ticker TEXT NOT NULL,
-            side TEXT NOT NULL,
-            previous_probability DOUBLE PRECISION NOT NULL,
-            current_probability DOUBLE PRECISION NOT NULL,
-            forecast_probability_change_points DOUBLE PRECISION NOT NULL,
-            pre_forecast_ask_cents DOUBLE PRECISION,
-            event_ask_cents DOUBLE PRECISION,
-            initial_market_change_points DOUBLE PRECISION,
-            initial_market_lag_points DOUBLE PRECISION,
-            initial_preliminary_edge_points DOUBLE PRECISION,
-            first_response_at TIMESTAMPTZ,
-            milestone_25_at TIMESTAMPTZ,
-            milestone_50_at TIMESTAMPTZ,
-            milestone_75_at TIMESTAMPTZ,
-            milestone_90_at TIMESTAMPTZ,
-            latest_observation_at TIMESTAMPTZ,
-            latest_ask_cents DOUBLE PRECISION,
-            latest_market_move_points DOUBLE PRECISION,
-            latest_lag_remaining_points DOUBLE PRECISION,
-            max_market_move_points DOUBLE PRECISION DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'open',
-            closed_at TIMESTAMPTZ,
-            settlement_result TEXT
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS forecast_research_updates (
-            id BIGSERIAL PRIMARY KEY,
-            event_id BIGINT NOT NULL REFERENCES forecast_research_events(id) ON DELETE CASCADE,
-            observed_at TIMESTAMPTZ NOT NULL,
-            market_ask_cents DOUBLE PRECISION,
-            market_move_points DOUBLE PRECISION,
-            lag_remaining_points DOUBLE PRECISION,
-            market_response_fraction DOUBLE PRECISION
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_research_events_open
-        ON forecast_research_events(status, created_at DESC)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_research_updates_event
-        ON forecast_research_updates(event_id, observed_at DESC)
-        """,
-    ]
-    for sql in statements:
-        db_execute(sql)
+def schema():
+    for s in [
+'''CREATE TABLE IF NOT EXISTS scan_runs(id BIGSERIAL PRIMARY KEY,started_at TIMESTAMPTZ NOT NULL,completed_at TIMESTAMPTZ,status TEXT NOT NULL,stats JSONB NOT NULL DEFAULT '{}'::jsonb,error TEXT)''',
+'''CREATE TABLE IF NOT EXISTS series_registry(series_ticker TEXT PRIMARY KEY,title TEXT NOT NULL,category TEXT,tags JSONB NOT NULL,settlement_sources JSONB NOT NULL,contract_terms_url TEXT,updated_at TIMESTAMPTZ NOT NULL,raw_series JSONB NOT NULL)''',
+'''CREATE TABLE IF NOT EXISTS weather_service_state(service TEXT NOT NULL,city TEXT NOT NULL,state_key TEXT NOT NULL,last_update TIMESTAMPTZ,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(service,city,state_key))''',
+'''CREATE TABLE IF NOT EXISTS forecast_observations(id BIGSERIAL PRIMARY KEY,observed_at TIMESTAMPTZ NOT NULL,city TEXT NOT NULL,variable TEXT NOT NULL,model TEXT NOT NULL,forecast_date DATE NOT NULL,scalar_value DOUBLE PRECISION,payload JSONB NOT NULL,payload_hash TEXT NOT NULL,UNIQUE(city,variable,model,forecast_date,payload_hash))''',
+'''CREATE TABLE IF NOT EXISTS market_snapshots(id BIGSERIAL PRIMARY KEY,observed_at TIMESTAMPTZ NOT NULL,ticker TEXT NOT NULL,event_ticker TEXT,series_ticker TEXT,market_date DATE,city TEXT,market_kind TEXT NOT NULL,strike_type TEXT,floor_strike DOUBLE PRECISION,cap_strike DOUBLE PRECISION,yes_bid_cents DOUBLE PRECISION,yes_ask_cents DOUBLE PRECISION,no_bid_cents DOUBLE PRECISION,no_ask_cents DOUBLE PRECISION,last_price_cents DOUBLE PRECISION,status TEXT,result TEXT)''',
+'''CREATE TABLE IF NOT EXISTS paper_trades(id BIGSERIAL PRIMARY KEY,signal_fingerprint TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ NOT NULL,settled_at TIMESTAMPTZ,city TEXT NOT NULL,forecast_date DATE NOT NULL,market_ticker TEXT NOT NULL,market_kind TEXT NOT NULL,side TEXT NOT NULL,entry_price_cents DOUBLE PRECISION NOT NULL,stake_dollars DOUBLE PRECISION NOT NULL,contracts DOUBLE PRECISION NOT NULL,model_probability_proxy DOUBLE PRECISION NOT NULL,preliminary_edge_points DOUBLE PRECISION NOT NULL,forecast_probability_change_points DOUBLE PRECISION NOT NULL,market_price_change_points DOUBLE PRECISION NOT NULL,market_lag_points DOUBLE PRECISION NOT NULL,forecast_temperature_change_f DOUBLE PRECISION,reason JSONB NOT NULL,result TEXT,profit_loss_dollars DOUBLE PRECISION,status TEXT NOT NULL DEFAULT 'open')''',
+'''CREATE TABLE IF NOT EXISTS alert_log(fingerprint TEXT PRIMARY KEY,sent_at TIMESTAMPTZ NOT NULL,payload JSONB NOT NULL)''',
+'''CREATE TABLE IF NOT EXISTS forecast_research_events(id BIGSERIAL PRIMARY KEY,event_fingerprint TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ NOT NULL,city TEXT NOT NULL,forecast_date DATE NOT NULL,variable TEXT NOT NULL,market_ticker TEXT NOT NULL,side TEXT NOT NULL,previous_probability DOUBLE PRECISION NOT NULL,current_probability DOUBLE PRECISION NOT NULL,forecast_probability_change_points DOUBLE PRECISION NOT NULL,pre_forecast_ask_cents DOUBLE PRECISION,event_ask_cents DOUBLE PRECISION,initial_market_change_points DOUBLE PRECISION,initial_market_lag_points DOUBLE PRECISION,initial_preliminary_edge_points DOUBLE PRECISION,first_response_at TIMESTAMPTZ,milestone_25_at TIMESTAMPTZ,milestone_50_at TIMESTAMPTZ,milestone_75_at TIMESTAMPTZ,milestone_90_at TIMESTAMPTZ,latest_observation_at TIMESTAMPTZ,latest_ask_cents DOUBLE PRECISION,latest_market_move_points DOUBLE PRECISION,latest_lag_remaining_points DOUBLE PRECISION,max_market_move_points DOUBLE PRECISION DEFAULT 0,status TEXT NOT NULL DEFAULT 'open',closed_at TIMESTAMPTZ,settlement_result TEXT)''',
+'''CREATE TABLE IF NOT EXISTS forecast_research_updates(id BIGSERIAL PRIMARY KEY,event_id BIGINT NOT NULL REFERENCES forecast_research_events(id) ON DELETE CASCADE,observed_at TIMESTAMPTZ NOT NULL,market_ask_cents DOUBLE PRECISION,market_move_points DOUBLE PRECISION,lag_remaining_points DOUBLE PRECISION,market_response_fraction DOUBLE PRECISION)''',
+'''CREATE TABLE IF NOT EXISTS weather_locations(location_key TEXT PRIMARY KEY,city_name TEXT NOT NULL,latitude DOUBLE PRECISION NOT NULL,longitude DOUBLE PRECISION NOT NULL,timezone TEXT NOT NULL,settlement_verified BOOLEAN NOT NULL DEFAULT FALSE,signal_enabled BOOLEAN NOT NULL DEFAULT FALSE,mapping_method TEXT NOT NULL,nws_grid_url TEXT,source_series_tickers JSONB NOT NULL DEFAULT '[]'::jsonb,raw_geocode JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''']:
+        q(s)
+    for s in [
+        'ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS schema_version INTEGER',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS scan_id BIGINT',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS snapshot_phase TEXT',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS measurement_version TEXT',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS spread_yes_cents DOUBLE PRECISION',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS spread_no_cents DOUBLE PRECISION',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS volume DOUBLE PRECISION',
+        'ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS open_interest DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS scan_id BIGINT',
+        'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS forecast_observed_at TIMESTAMPTZ',
+        'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS measurement_version TEXT',
+        'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS settlement_verified BOOLEAN',
+        'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS location_key TEXT',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS scan_id BIGINT',
+        'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS source_observed_at TIMESTAMPTZ',
+        'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS measurement_version TEXT']:
+        q(s)
+    for s in ['CREATE INDEX IF NOT EXISTS idx_forecast_lookup ON forecast_observations(city,variable,model,forecast_date,observed_at DESC)','CREATE INDEX IF NOT EXISTS idx_market_lookup ON market_snapshots(ticker,observed_at DESC)','CREATE INDEX IF NOT EXISTS idx_market_scan ON market_snapshots(scan_id,snapshot_phase,observed_at DESC)','CREATE INDEX IF NOT EXISTS idx_research_open ON forecast_research_events(status,created_at DESC)','CREATE INDEX IF NOT EXISTS idx_updates_event ON forecast_research_updates(event_id,observed_at DESC)']:q(s)
+    for k,(city,lat,lon,tz,verified) in KNOWN.items():
+        q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method) VALUES(%s,%s,%s,%s,%s,%s,%s,'manual_existing') ON CONFLICT(location_key) DO NOTHING''',(k,city,lat,lon,tz,verified,verified))
 
+def series_list():
+    out=[];cur=None
+    while True:
+        p={'category':'Climate and Weather','limit':1000};
+        if cur:p['cursor']=cur
+        d=http(KALSHI_API_URL+'/series',p);out+=d.get('series',[]);cur=d.get('cursor')
+        if not cur:return out
 
-def payload_hash(payload):
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def save_series(xs):
+    c=db()
+    try:
+        with c.cursor() as cur:
+            cur.executemany('''INSERT INTO series_registry(series_ticker,title,category,tags,settlement_sources,contract_terms_url,updated_at,raw_series) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s) ON CONFLICT(series_ticker) DO UPDATE SET title=EXCLUDED.title,category=EXCLUDED.category,tags=EXCLUDED.tags,settlement_sources=EXCLUDED.settlement_sources,contract_terms_url=EXCLUDED.contract_terms_url,updated_at=NOW(),raw_series=EXCLUDED.raw_series''',[(x.get('ticker'),x.get('title',''),x.get('category'),Json(x.get('tags') or []),Json(x.get('settlement_sources') or []),x.get('contract_terms_url'),Json(x)) for x in xs if x.get('ticker')])
+        c.commit()
+    except: c.rollback();raise
+    finally:c.close()
 
+def is_temp(s):
+    t=(s.get('title') or '').lower();x=(s.get('ticker') or '').upper();freq=(s.get('frequency') or '').lower()
+    return (not freq or freq=='daily') and 'lowest temperature' not in t and (x.startswith('KXHIGH') or 'highest temperature' in t or 'high temperature' in t or 'maximum temperature' in t)
+def is_rain(s):
+    t=(s.get('title') or '').lower();x=(s.get('ticker') or '').upper();return x=='KXRAIN' or ((s.get('frequency') or '').lower()=='daily' and ('rain' in t or 'precipitation' in t))
+def city_title(s):
+    t=' '.join((s.get('title') or '').split())
+    m=re.search(r'(?:temperature|rain|precipitation)\s+in\s+(.+?)(?:\s+today\??|\s+on\s+.+?\??$|\?$|$)',t,re.I)
+    return m.group(1).strip(' ?.') if m else None
 
-def insert_forecast(city, variable, model, date_key, scalar, payload):
-    db_execute(
-        """
-        INSERT INTO forecast_observations(
-            observed_at,city,variable,model,forecast_date,
-            scalar_value,payload,payload_hash
-        ) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING
-        """,
-        (
-            city,
-            variable,
-            model,
-            date_key,
-            scalar,
-            Json(payload),
-            payload_hash(payload),
-        ),
-    )
+def geocode(city):
+    d=http(GEOCODING_API_URL,{'name':city,'count':5,'language':'en','format':'json','countryCode':'US'})
+    rs=[r for r in d.get('results',[]) if str(r.get('country_code','')).upper()=='US']
+    if not rs:return None
+    norm=re.sub(r'[^a-z0-9]','',city.lower());rs.sort(key=lambda r:0 if re.sub(r'[^a-z0-9]','',str(r.get('name','')).lower())==norm else 1);r=rs[0]
+    return r if r.get('latitude') is not None and r.get('longitude') is not None and r.get('timezone') else None
 
+def loc_for(s):
+    x=(s.get('ticker') or '').upper();mp={'KXHIGHNY':'NYC','HIGHNY':'NYC','KXHIGHCHI':'CHI','HIGHCHI':'CHI','KXHIGHMIA':'MIA','HIGHMIA':'MIA','KXHIGHAUS':'AUS','HIGHAUS':'AUS'}
+    for p,k in mp.items():
+        if p in x:
+            r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
+    city=city_title(s)
+    if not city:return None
+    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE lower(city_name)=lower(%s) LIMIT 1',(city,),one=True)
+    if r:return rowloc(r)
+    g=geocode(city)
+    if not g:return None
+    k=slug(g.get('name') or city)
+    q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),Json(g)))
+    return getloc(k)
+def rowloc(r):
+    return {'location_key':r[0],'city_name':r[1],'latitude':r[2],'longitude':r[3],'timezone':r[4],'settlement_verified':bool(r[5]),'signal_enabled':bool(r[6]),'mapping_method':r[7],'nws_grid_url':r[8]}
+def getloc(k):
+    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
 
-def latest_forecast(city, variable, model, date_key):
-    return db_execute(
-        """
-        SELECT observed_at, scalar_value, payload
-        FROM forecast_observations
-        WHERE city=%s AND variable=%s AND model=%s AND forecast_date=%s
-        ORDER BY observed_at DESC
-        LIMIT 1
-        """,
-        (city, variable, model, date_key),
-        fetchone=True,
-    )
+def discover(xs):
+    temps=[];rains=[];seen_t=set();seen_r=set()
+    for s in xs:
+        if is_temp(s):
+            l=loc_for(s)
+            if l:temps.append((s,l))
+        elif is_rain(s):
+            l=loc_for(s)
+            if l:rains.append((s,l))
+    by={}
+    for s,l in temps:
+        by.setdefault(l['location_key'],[]).append((s,l))
+    temps=[]
+    for k,es in sorted(by.items()):
+        es.sort(key=lambda z:(0 if (z[0].get('ticker') or '').upper().startswith('KXHIGH') else 1,z[0].get('ticker') or ''));temps.append(es[0])
+    for e in rains:
+        if e[0].get('ticker') not in seen_r:seen_r.add(e[0].get('ticker'));seen_t.add(e[0].get('ticker')); 
+    rains=[e for e in rains if e[0].get('ticker') in seen_r]
+    return temps,rains
 
+def markets(ticker):
+    out=[];cur=None
+    while True:
+        p={'series_ticker':ticker,'status':'open','limit':1000};
+        if cur:p['cursor']=cur
+        d=http(KALSHI_API_URL+'/markets',p);out+=d.get('markets',[]);cur=d.get('cursor')
+        if not cur:return out
 
-def latest_market(ticker):
-    return db_execute(
-        """
-        SELECT observed_at, yes_bid_cents, yes_ask_cents,
-               no_bid_cents, no_ask_cents, last_price_cents
-        FROM market_snapshots
-        WHERE ticker=%s
-        ORDER BY observed_at DESC
-        LIMIT 1
-        """,
-        (ticker,),
-        fetchone=True,
-    )
-
-
-def parse_market_date(market):
-    event_ticker = market.get("event_ticker") or ""
-    ticker = market.get("ticker") or ""
-    for source in (event_ticker, ticker):
-        for part in source.split("-"):
-            try:
-                return datetime.strptime(part, "%y%b%d").date().isoformat()
-            except ValueError:
-                pass
+def date_market(m):
+    for s in (m.get('event_ticker',''),m.get('ticker','')):
+        for p in s.split('-'):
+            try:return datetime.strptime(p,'%y%b%d').date().isoformat()
+            except:pass
     return None
 
+def cache(entries): return [(s,l,markets(s.get('ticker'))) for s,l in entries]
 
-def location_from_title_or_ticker(series):
-    title = (series.get("title") or "").upper()
-    ticker = (series.get("ticker") or "").upper()
+def snapshot(cache,scan_id,phase,stats):
+    for kind,entries in [('temperature',cache['temperature']),('precipitation',cache['rain'])]:
+        for s,l,ms in entries:
+            for m in ms:
+                yb=f(m.get('yes_bid_dollars'));ya=f(m.get('yes_ask_dollars'));nb=f(m.get('no_bid_dollars'));na=f(m.get('no_ask_dollars'))
+                q('''INSERT INTO market_snapshots(observed_at,ticker,event_ticker,series_ticker,market_date,city,market_kind,strike_type,floor_strike,cap_strike,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents,status,result,spread_yes_cents,spread_no_cents,volume,open_interest,scan_id,snapshot_phase,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',(m.get('ticker',''),m.get('event_ticker'),m.get('series_ticker'),date_market(m),l['city_name'],kind,m.get('strike_type'),f(m.get('floor_strike')),f(m.get('cap_strike')),None if yb is None else yb*100,None if ya is None else ya*100,None if nb is None else nb*100,None if na is None else na*100,None if f(m.get('last_price_dollars')) is None else f(m.get('last_price_dollars'))*100,m.get('status'),m.get('result'),None if yb is None or ya is None else max(0,ya*100-yb*100),None if nb is None or na is None else max(0,na*100-nb*100),f(m.get('volume')),f(m.get('open_interest')),scan_id,phase,MEASUREMENT_VERSION))
+                stats['temperature_markets' if kind=='temperature' else 'rain_markets']+=1
 
-    # Current Kalshi weather series use tickers such as KXHIGHNY,
-    # KXHIGHCHI, KXHIGHMIA, and KXHIGHAUS. Older/duplicate series
-    # such as HIGHCHI may also appear in the API response. Prefer the
-    # explicit ticker mapping before falling back to title matching.
-    ticker_map = (
-        ("KXHIGHNY", "NYC"),
-        ("HIGHNY", "NYC"),
-        ("KXHIGHCHI", "CHI"),
-        ("HIGHCHI", "CHI"),
-        ("KXHIGHMIA", "MIA"),
-        ("HIGHMIA", "MIA"),
-        ("KXHIGHAUS", "AUS"),
-        ("HIGHAUS", "AUS"),
-    )
-    for prefix, code in ticker_map:
-        if ticker == prefix or ticker.startswith(prefix + "-") or prefix in ticker:
-            return LOCATION_MAP[code]
+def prior_market(ticker,before):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,before,MEASUREMENT_VERSION),one=True)
+def event_market(ticker,scan):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND scan_id=%s AND snapshot_phase=\'forecast_event\' AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,scan,MEASUREMENT_VERSION),one=True)
 
-    aliases = {
-        "NEW YORK CITY": "NYC",
-        "NEW YORK": "NYC",
-        "NYC": "NYC",
-        "CHICAGO": "CHI",
-        "MIAMI": "MIA",
-        "AUSTIN": "AUS",
-    }
-    for alias, code in aliases.items():
-        if alias in title:
-            return LOCATION_MAP[code]
-    return None
+def tprob(vals,m):
+    vals=[round_temp(v) for v in vals if round_temp(v) is not None];
+    if not vals:return None
+    st=(m.get('strike_type') or '').lower();lo=f(m.get('floor_strike'));hi=f(m.get('cap_strike'))
+    if st=='greater':hits=sum(v>lo for v in vals) if lo is not None else None
+    elif st=='less':hits=sum(v<hi for v in vals) if hi is not None else None
+    elif st=='between':hits=sum(lo<=v<=hi for v in vals) if lo is not None and hi is not None else None
+    else:return None
+    return None if hits is None else 100*hits/len(vals)
+def rprob(vals):
+    vals=[f(v) for v in vals if f(v) is not None];return None if not vals else 100*sum(v>0 for v in vals)/len(vals)
 
+def forecast_prev(city,var,date,before):
+    r=q('SELECT payload FROM forecast_observations WHERE city=%s AND variable=%s AND model=%s AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC LIMIT 1',(city,var,ENSEMBLE_MODEL,date,before,MEASUREMENT_VERSION),one=True);return r[0] if r else None
+def save_forecasts(det,ens,observed):
+    for k,d in det.items():
+        l=getloc(k);city=l['city_name']
+        for date,x in d['daily'].items():
+            for var,val,p in [('temperature_high',x['high'],x),('precipitation_sum',x['precipitation_sum'],x)]:
+                p={**p,'model_run':d.get('model_run'),'location_key':k};q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,var,DETERMINISTIC_MODEL,date,val,Json(p),h(p),observed,MEASUREMENT_VERSION))
+    for k,d in ens.items():
+        l=getloc(k);city=l['city_name']
+        for date,x in d['daily'].items():
+            p={'member_highs':x['member_highs'],'member_highs_rounded':[round_temp(v) for v in x['member_highs']],'member_precip_totals':x['member_precip_totals'],'temperature_mean':x['temperature_mean'],'temperature_median':x['temperature_median'],'temperature_member_count':d['temperature_member_count'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
+            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_temperature_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,x['temperature_mean'],Json(p),h(p),observed,MEASUREMENT_VERSION))
+            if x['member_precip_totals']:
+                p={'member_precip_totals':x['member_precip_totals'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
+                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),Json(p),h(p),observed,MEASUREMENT_VERSION))
 
-def temperature_series(series):
-    title = (series.get("title") or "").lower()
-    tags = " ".join(str(x).lower() for x in (series.get("tags") or []))
-    text = title + " " + tags
-    return (
-        series.get("frequency") == "daily"
-        and "temperature" in text
-        and any(word in title for word in ("highest", "high", "maximum"))
-    )
-
-
-def is_rain_series(series):
-    ticker = (series.get("ticker") or "").upper()
-    title = (series.get("title") or "").lower()
-    return ticker == "KXRAIN" or (
-        series.get("frequency") == "daily"
-        and ("rain" in title or "precipitation" in title)
-    )
-
-
-def http_json(url, params=None):
-    response = requests.get(
-        url,
-        params=params,
-        headers={
-            "User-Agent": "WeatherKalshiResearchBot/6.0",
-            "Accept": "application/json",
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:800]}")
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise RuntimeError("API returned invalid JSON") from exc
-
-
-def nws_json(url, timeout_seconds=None, attempts=2):
-    """Fetch an NWS JSON resource with bounded retries for transient failures."""
-    timeout_value = timeout_seconds if timeout_seconds is not None else min(REQUEST_TIMEOUT, 12)
-    last_exc = None
-    for attempt in range(1, attempts + 1):
+def nws_updates(locations):
+    out={};changed={}
+    for l in locations:
         try:
-            response = requests.get(
-                url,
-                headers={
-                    "User-Agent": NWS_USER_AGENT,
-                    "Accept": "application/geo+json, application/ld+json, application/json",
-                },
-                timeout=timeout_value,
-            )
-            if 200 <= response.status_code < 300:
-                try:
-                    return response.json()
-                except ValueError as exc:
-                    raise RuntimeError("NWS API returned invalid JSON") from exc
-            if response.status_code in {408, 429, 500, 502, 503, 504} and attempt < attempts:
-                time.sleep(1.0)
-                continue
-            raise RuntimeError(f"NWS {response.status_code}: {response.text[:500]}")
-        except requests.RequestException as exc:
-            last_exc = exc
-            if attempt < attempts:
-                time.sleep(1.0)
-                continue
-            raise RuntimeError(f"NWS request failed: {exc}") from exc
-    raise RuntimeError(f"NWS request failed: {last_exc}")
+            url=l.get('nws_grid_url')
+            if not url:
+                p=nws(f"{NWS_API_URL}/points/{l['latitude']},{l['longitude']}");url=(p.get('properties') or {}).get('forecastGridData');
+                if url:q('UPDATE weather_locations SET nws_grid_url=%s,updated_at=NOW() WHERE location_key=%s',(url,l['location_key']))
+            if not url:continue
+            d=nws(url);u=(d.get('properties') or {}).get('updateTime')
+            if not u:continue
+            dt=datetime.fromisoformat(u.replace('Z','+00:00'));out[l['location_key']]=dt
+            r=q("SELECT last_update FROM weather_service_state WHERE service='NWS_GRID' AND city=%s AND state_key=%s",(l['city_name'],l['location_key']),one=True)
+            if not r or not r[0] or dt>r[0]:changed[l['location_key']]=dt
+        except Exception as e:log.warning('NWS update unavailable for %s: %s',l['city_name'],e)
+    return out,changed
+def save_nws(us,locs):
+    for k,u in us.items():
+        l=locs.get(k)
+        if l:q('''INSERT INTO weather_service_state(service,city,state_key,last_update,updated_at) VALUES('NWS_GRID',%s,%s,%s,NOW()) ON CONFLICT(service,city,state_key) DO UPDATE SET last_update=EXCLUDED.last_update,updated_at=NOW()''',(l['city_name'],k,u))
 
+def norm(data,locs):
+    rows=data if isinstance(data,list) else [data]
+    if len(rows)!=len(locs):raise RuntimeError(f'Forecast API returned {len(rows)} locations; expected {len(locs)}')
+    return zip(locs,rows)
+def hourly(loc,d):
+    x=d.get('hourly') or {};ts=x.get('time') or [];temps=x.get('temperature_2m') or [];rain=x.get('precipitation') or [];g=defaultdict(lambda:{'t':[],'p':[]})
+    for i,t in enumerate(ts):
+        day=local_date(t,loc['timezone']);
+        if i<len(temps) and f(temps[i]) is not None:g[day]['t'].append(f(temps[i]))
+        if i<len(rain) and f(rain[i]) is not None:g[day]['p'].append(f(rain[i]))
+    return {day:{'high':max(v['t']),'precipitation_sum':sum(v['p'])} for day,v in g.items() if v['t']}
+def fetch_det(locs):
+    p={'latitude':','.join(str(x['latitude']) for x in locs),'longitude':','.join(str(x['longitude']) for x in locs),'models':DETERMINISTIC_MODEL,'hourly':'temperature_2m,precipitation','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':'UTC','forecast_days':FORECAST_DAYS};d=http('https://api.open-meteo.com/v1/gfs',p);return {l['location_key']:{'daily':hourly(l,x),'model_run':x.get('model_run') or x.get('model_run_id') or x.get('model_run_time')} for l,x in norm(d,locs)}
+def fetch_ens(locs):
+    p={'latitude':','.join(str(x['latitude']) for x in locs),'longitude':','.join(str(x['longitude']) for x in locs),'models':ENSEMBLE_MODEL,'hourly':'temperature_2m,precipitation','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':'UTC','forecast_days':FORECAST_DAYS};data=http('https://ensemble-api.open-meteo.com/v1/ensemble',p);out={}
+    for l,d in norm(data,locs):
+        x=d.get('hourly') or {};ts=x.get('time') or [];tk=sorted(k for k in x if k.startswith('temperature_2m_member'));pk=sorted(k for k in x if k.startswith('precipitation_member'));days=defaultdict(lambda:{'t':defaultdict(list),'p':defaultdict(float)})
+        if not tk:raise RuntimeError(f'No ensemble temperature members for {l["city_name"]}')
+        for i,t in enumerate(ts):
+            day=local_date(t,l['timezone'])
+            for k in tk:
+                a=x.get(k) or []
+                if i<len(a) and f(a[i]) is not None:days[day]['t'][k].append(f(a[i]))
+            for k in pk:
+                a=x.get(k) or []
+                if i<len(a) and f(a[i]) is not None:days[day]['p'][k]+=f(a[i])
+        daily={}
+        for day,v in days.items():
+            highs=[max(a) for a in v['t'].values() if a];rain=list(v['p'].values())
+            if highs:daily[day]={'member_highs':highs,'member_precip_totals':rain,'temperature_mean':statistics.mean(highs),'temperature_median':statistics.median(highs)}
+        out[l['location_key']]={'daily':daily,'temperature_member_count':len(tk),'precipitation_member_count':len(pk),'model_run':d.get('model_run') or d.get('model_run_id') or d.get('model_run_time')}
+    return out
 
-def fetch_nws_updates(city_names):
-    """Return successful NWS grid forecast update timestamps keyed by city code.
+def create_research(l,date,var,m,prevp,curp,preask,eventask,scan,observed,stats):
+    ch=curp-prevp
+    if abs(ch)<RESEARCH_MIN_FORECAST_CHANGE_POINTS:return
+    side='YES' if ch>=0 else 'NO';prev_side=prevp if side=='YES' else 100-prevp;cur_side=curp if side=='YES' else 100-curp;side_ch=ch if side=='YES' else -ch;market_ch=eventask-preask;lag=side_ch-market_ch;edge=cur_side-eventask;fp=h({'city':l['city_name'],'date':date,'var':var,'ticker':m.get('ticker'),'forecast':curp,'previous':prevp})[:32]
+    r=q('''INSERT INTO forecast_research_events(event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,previous_probability,current_probability,forecast_probability_change_points,pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,initial_market_lag_points,initial_preliminary_edge_points,status,scan_id,forecast_observed_at,measurement_version,settlement_verified,location_key) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(event_fingerprint) DO NOTHING RETURNING id''',(fp,l['city_name'],date,var,m.get('ticker',''),side,prev_side,cur_side,side_ch,preask,eventask,market_ch,lag,edge,'open' if lag>0 else 'no_initial_lag',scan,observed,MEASUREMENT_VERSION,l['settlement_verified'],l['location_key']),one=True)
+    if r:stats['research_events_created']+=1
 
-    The NWS /points endpoint supplies the current WFO/grid mapping. The
-    forecastGridData product is the raw NDFD forecast product, so its
-    ``updateTime`` is the version marker. NWS availability is treated as a
-    per-city dependency: a temporary timeout for one city must not stop the
-    scanner from checking Kalshi or processing another city's fresh update.
-    """
-    updates = {}
-    failures = {}
-    for code in city_names:
-        _, lat, lon, _, _ = LOCATION_MAP[code]
-        try:
-            point = nws_json(f"{NWS_API_URL}/points/{lat},{lon}")
-            properties = point.get("properties") or {}
-            grid_url = properties.get("forecastGridData")
-            if not grid_url:
-                raise RuntimeError(f"NWS: no forecastGridData URL for {code}")
+def process_research(cache,ens,before,scan,observed,stats):
+    for kind,keyvar,probfun in [('temperature','ensemble_temperature_distribution',tprob),('rain','ensemble_rain_distribution',rprob)]:
+        for s,l,ms in cache[kind]:
+            for m in ms:
+                date=date_market(m)
+                if not date:continue
+                d=ens.get(l['location_key'],{}).get('daily',{}).get(date)
+                if not d:continue
+                curvals=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
+                prev=forecast_prev(l['city_name'],keyvar,date,before)
+                if not prev:stats['research_missing_previous_forecast']+=1;continue
+                prevvals=prev.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
+                cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals);pp=probfun(prevvals,m) if kind=='temperature' else probfun(prevvals)
+                if cp is None or pp is None:continue
+                stats['research_current_forecasts']+=1;stats['research_previous_forecasts']+=1
+                pm=prior_market(m.get('ticker',''),before);em=event_market(m.get('ticker',''),scan)
+                if not pm or not em:stats['research_missing_previous_market']+=1;continue
+                pa=pm[2] if cp>=pp else pm[4];ea=em[2] if cp>=pp else em[4]
+                if pa is not None and ea is not None:create_research(l,date,'temperature' if kind=='temperature' else 'precipitation',m,pp,cp,pa,ea,scan,observed,stats)
 
-            grid = nws_json(grid_url)
-            grid_properties = grid.get("properties") or {}
-            updated = grid_properties.get("updateTime") or grid_properties.get("updated")
-            if not updated:
-                raise RuntimeError(f"NWS: no grid forecast update timestamp for {code}")
-
-            dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            updates[code] = dt.astimezone(timezone.utc)
-        except Exception as exc:
-            failures[code] = str(exc)
-            log.warning("NWS update check failed for %s; keeping last known state: %s", code, exc)
-
-    if failures:
-        log.warning("NWS update check completed with %d/%d city failures", len(failures), len(city_names))
-    if not updates:
-        raise RuntimeError("NWS update check failed for every monitored city")
-    return updates
-
-
-def get_nws_state(code):
-    row = db_execute(
-        "SELECT last_update_at FROM weather_service_state WHERE city_code=%s AND source='nws'",
-        (code,),
-        fetchone=True,
-    )
-    return row[0] if row else None
-
-
-def save_nws_state(updates):
-    for code, updated_at in updates.items():
-        db_execute(
-            """
-            INSERT INTO weather_service_state(city_code,source,last_update_at,checked_at)
-            VALUES(%s,'nws',%s,NOW())
-            ON CONFLICT(city_code) DO UPDATE SET
-                source='nws',
-                last_update_at=EXCLUDED.last_update_at,
-                checked_at=NOW()
-            """,
-            (code, updated_at),
-        )
-
-
-def detect_nws_updates(city_names):
-    """Check whether NWS has published a newer forecast for any monitored city."""
-    updates = fetch_nws_updates(city_names)
-    changed = {}
-    for code, updated_at in updates.items():
-        last_update = get_nws_state(code)
-        if last_update is None or updated_at > last_update:
-            changed[code] = updated_at
-    return updates, changed
-
-
-def location_params(city_names):
-    return {
-        "latitude": ",".join(str(LOCATION_MAP[x][1]) for x in city_names),
-        "longitude": ",".join(str(LOCATION_MAP[x][2]) for x in city_names),
-    }
-
-
-def normalize_locations(data, city_names, label):
-    if isinstance(data, list):
-        locations = data
-    elif isinstance(data, dict):
-        locations = [data]
-    else:
-        raise RuntimeError(f"{label}: unexpected JSON type {type(data).__name__}")
-    if len(locations) != len(city_names):
-        raise RuntimeError(
-            f"{label}: expected {len(city_names)} locations, got {len(locations)}"
-        )
-    return list(zip(city_names, locations))
-
-
-def local_date(timestamp, timezone_name):
-    dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(ZoneInfo(timezone_name)).date().isoformat()
-
-
-def aggregate_hourly(location_data, city_name):
-    hourly = location_data.get("hourly") or {}
-    timestamps = hourly.get("time") or []
-    temps = hourly.get("temperature_2m") or []
-    precip = hourly.get("precipitation") or []
-    grouped = defaultdict(lambda: {"temps": [], "precip": []})
-    tz_name = LOCATION_MAP[city_name][3]
-    for i, timestamp in enumerate(timestamps):
-        date_key = local_date(timestamp, tz_name)
-        if i < len(temps):
-            temp = safe_float(temps[i])
-            if temp is not None:
-                grouped[date_key]["temps"].append(temp)
-        if i < len(precip):
-            rain = safe_float(precip[i])
-            if rain is not None:
-                grouped[date_key]["precip"].append(rain)
-    result = {}
-    for date_key, values in grouped.items():
-        if not values["temps"]:
-            continue
-        result[date_key] = {
-            "high": max(values["temps"]),
-            "precipitation_sum": sum(values["precip"]),
-        }
-    return result
-
-
-def fetch_gfs_deterministic(city_names):
-    params = location_params(city_names)
-    params.update(
-        {
-            "models": DETERMINISTIC_MODEL,
-            "hourly": "temperature_2m,precipitation",
-            "temperature_unit": "fahrenheit",
-            "precipitation_unit": "inch",
-            "timezone": "UTC",
-            "forecast_days": FORECAST_DAYS,
-        }
-    )
-    log.info("Fetching deterministic GFS: %s", DETERMINISTIC_MODEL)
-    data = http_json("https://api.open-meteo.com/v1/gfs", params)
-    output = {}
-    for city, location_data in normalize_locations(data, city_names, "deterministic GFS"):
-        output[city] = {
-            "daily": aggregate_hourly(location_data, city),
-            "model_run": (
-                location_data.get("model_run")
-                or location_data.get("model_run_id")
-                or location_data.get("model_run_time")
-            ),
-        }
-    return output
-
-
-def fetch_ensemble(city_names):
-    params = location_params(city_names)
-    params.update(
-        {
-            "models": ENSEMBLE_MODEL,
-            "hourly": "temperature_2m,precipitation",
-            "temperature_unit": "fahrenheit",
-            "precipitation_unit": "inch",
-            "timezone": "UTC",
-            "forecast_days": FORECAST_DAYS,
-        }
-    )
-    log.info("Fetching ensemble: %s", ENSEMBLE_MODEL)
-    data = http_json("https://ensemble-api.open-meteo.com/v1/ensemble", params)
-    output = {}
-    for city, location_data in normalize_locations(data, city_names, "ensemble"):
-        hourly = location_data.get("hourly") or {}
-        timestamps = hourly.get("time") or []
-        temp_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
-        precip_keys = sorted(k for k in hourly if k.startswith("precipitation_member"))
-        if not temp_keys:
-            raise RuntimeError(f"ensemble: no temperature ensemble members for {city}")
-
-        day = defaultdict(lambda: {"temp": defaultdict(list), "precip": defaultdict(float)})
-        tz_name = LOCATION_MAP[city][3]
-        for i, timestamp in enumerate(timestamps):
-            date_key = local_date(timestamp, tz_name)
-            for key in temp_keys:
-                values = hourly.get(key) or []
-                if i < len(values):
-                    value = safe_float(values[i])
-                    if value is not None:
-                        day[date_key]["temp"][key].append(value)
-            for key in precip_keys:
-                values = hourly.get(key) or []
-                if i < len(values):
-                    value = safe_float(values[i])
-                    if value is not None:
-                        day[date_key]["precip"][key] += value
-
-        city_daily = {}
-        for date_key, values in day.items():
-            highs = [max(v) for v in values["temp"].values() if v]
-            rain = list(values["precip"].values())
-            if highs:
-                city_daily[date_key] = {
-                    "member_highs": highs,
-                    "member_precip_totals": rain,
-                    "temperature_mean": statistics.mean(highs),
-                    "temperature_median": statistics.median(highs),
-                }
-        output[city] = {
-            "daily": city_daily,
-            "temperature_member_count": len(temp_keys),
-            "precipitation_member_count": len(precip_keys),
-        }
-    return output
-
-
-def save_weather_forecasts(deterministic, ensemble):
-    for model, cities in deterministic.items():
-        for city, data in cities.items():
-            for date_key, daily in data["daily"].items():
-                insert_forecast(
-                    city,
-                    "temperature_high",
-                    model,
-                    date_key,
-                    daily["high"],
-                    {**daily, "model_run": data.get("model_run")},
-                )
-                insert_forecast(
-                    city,
-                    "precipitation_sum",
-                    model,
-                    date_key,
-                    daily["precipitation_sum"],
-                    {**daily, "model_run": data.get("model_run")},
-                )
-
-    for city, data in ensemble.items():
-        for date_key, daily in data["daily"].items():
-            insert_forecast(
-                city,
-                "ensemble_temperature_distribution",
-                ENSEMBLE_MODEL,
-                date_key,
-                daily["temperature_mean"],
-                {"member_highs": daily["member_highs"]},
-            )
-            if daily["member_precip_totals"]:
-                insert_forecast(
-                    city,
-                    "ensemble_rain_distribution",
-                    ENSEMBLE_MODEL,
-                    date_key,
-                    statistics.mean(daily["member_precip_totals"]),
-                    {"member_precip_totals": daily["member_precip_totals"]},
-                )
-
-
-def temperature_probability(member_highs, market):
-    if not member_highs:
-        return None
-    strike_type = (market.get("strike_type") or "").lower()
-    floor = safe_float(market.get("floor_strike"))
-    cap = safe_float(market.get("cap_strike"))
-    if strike_type == "greater" and floor is not None:
-        hits = sum(value > floor for value in member_highs)
-    elif strike_type == "less" and cap is not None:
-        hits = sum(value < cap for value in member_highs)
-    elif strike_type == "between" and floor is not None and cap is not None:
-        hits = sum(floor <= value <= cap for value in member_highs)
-    else:
-        return None
-    return 100.0 * hits / len(member_highs)
-
-
-def rain_probability(member_precip_totals):
-    """Probability proxy for KXRAIN: total daily precipitation > 0 inches."""
-    if not member_precip_totals:
-        return None
-    hits = sum(value > 0.0 for value in member_precip_totals)
-    return 100.0 * hits / len(member_precip_totals)
-
-
-def rain_city_from_ticker(market):
-    ticker = (market.get("ticker") or "").upper()
-    if not ticker.startswith("KXRAIN-"):
-        return None
-    parts = ticker.split("-")
-    if len(parts) < 3:
-        return None
-    code = parts[-1]
-    return code if code in LOCATION_MAP else None
-
-
-def prior_rain_member_data(city, date_key):
-    row = latest_forecast(city, "ensemble_rain_distribution", ENSEMBLE_MODEL, date_key)
-    return (row[2] or {}) if row else None
-
-
-def build_rain_candidate(city, date_key, market, current_probability, previous_probability):
-    if current_probability is None or previous_probability is None:
-        return None
-
-    probability_change = current_probability - previous_probability
-    if abs(probability_change) < MIN_FORECAST_PROBABILITY_CHANGE_POINTS:
-        return None
-
-    ticker = market.get("ticker") or ""
-    previous_market = latest_market(ticker)
-    if not previous_market:
-        return None
-
-    best = None
-    for side in ("YES", "NO"):
-        ask = get_side_ask_cents(market, side)
-        if ask is None or not (MIN_ENTRY_PRICE_CENTS <= ask <= MAX_ENTRY_PRICE_CENTS):
-            continue
-
-        side_probability = current_probability if side == "YES" else 100.0 - current_probability
-        side_probability_change = probability_change if side == "YES" else -probability_change
-        previous_ask = safe_float(previous_market[2] if side == "YES" else previous_market[4])
-        if previous_ask is None:
-            continue
-
-        market_change = ask - previous_ask
-        market_lag = side_probability_change - market_change
-        preliminary_edge = side_probability - ask
-
-        if market_lag < MIN_MARKET_LAG_POINTS:
-            continue
-        if preliminary_edge < MIN_PRELIMINARY_EDGE_POINTS:
-            continue
-
-        candidate = {
-            "city": city,
-            "forecast_date": date_key,
-            "market_ticker": ticker,
-            "market_kind": "precipitation",
-            "side": side,
-            "entry_price_cents": ask,
-            "model_probability_proxy": side_probability,
-            "preliminary_edge_points": preliminary_edge,
-            "forecast_probability_change_points": side_probability_change,
-            "market_price_change_points": market_change,
-            "market_lag_points": market_lag,
-            "forecast_temperature_change_f": None,
-            "contract_label": market.get("title") or "",
-        }
-        if best is None or (candidate["market_lag_points"], candidate["preliminary_edge_points"]) > (best["market_lag_points"], best["preliminary_edge_points"]):
-            best = candidate
+def candidate(l,date,m,cp,pp,pm,em,kind='temperature'):
+    if cp is None or pp is None or not pm or not em or abs(cp-pp)<MIN_FORECAST_PROBABILITY_CHANGE_POINTS:return None
+    best=None;ch=cp-pp
+    for side in ('YES','NO'):
+        ask=em[2] if side=='YES' else em[4];prev=pm[2] if side=='YES' else pm[4]
+        if ask is None or prev is None or not MIN_ENTRY_PRICE_CENTS<=ask<=MAX_ENTRY_PRICE_CENTS:continue
+        sp=cp if side=='YES' else 100-cp;sch=ch if side=='YES' else -ch;mc=ask-prev;lag=sch-mc;edge=sp-ask
+        if lag<MIN_MARKET_LAG_POINTS or edge<MIN_PRELIMINARY_EDGE_POINTS:continue
+        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None}
+        if best is None or (z['market_lag_points'],z['preliminary_edge_points'])>(best['market_lag_points'],best['preliminary_edge_points']):best=z
     return best
 
-
-def get_side_ask_cents(market, side):
-    field = "yes_ask_dollars" if side == "YES" else "no_ask_dollars"
-    value = safe_float(market.get(field))
-    return None if value is None else value * 100.0
-
-
-def location_signal_allowed(location):
-    return bool(location[4]) or ALLOW_UNVERIFIED_LOCATION_SIGNALS
-
-
-def prior_member_data(city, date_key, variable):
-    row = latest_forecast(city, variable, ENSEMBLE_MODEL, date_key)
-    return (row[2] or {}) if row else None
-
-
-def build_candidate(city, date_key, market, current_probability, previous_probability):
-    if current_probability is None or previous_probability is None:
-        return None
-
-    probability_change = current_probability - previous_probability
-    if abs(probability_change) < MIN_FORECAST_PROBABILITY_CHANGE_POINTS:
-        return None
-
-    ticker = market.get("ticker") or ""
-    previous_market = latest_market(ticker)
-    if not previous_market:
-        return None
-
-    best = None
-    for side in ("YES", "NO"):
-        ask = get_side_ask_cents(market, side)
-        if ask is None or not (MIN_ENTRY_PRICE_CENTS <= ask <= MAX_ENTRY_PRICE_CENTS):
-            continue
-
-        side_probability = current_probability if side == "YES" else 100.0 - current_probability
-        side_probability_change = probability_change if side == "YES" else -probability_change
-        previous_ask = safe_float(
-            previous_market[2] if side == "YES" else previous_market[4]
-        )
-        if previous_ask is None:
-            continue
-
-        market_change = ask - previous_ask
-        market_lag = side_probability_change - market_change
-        preliminary_edge = side_probability - ask
-
-        if market_lag < MIN_MARKET_LAG_POINTS:
-            continue
-        if preliminary_edge < MIN_PRELIMINARY_EDGE_POINTS:
-            continue
-
-        candidate = {
-            "city": city,
-            "forecast_date": date_key,
-            "market_ticker": ticker,
-            "market_kind": "temperature",
-            "side": side,
-            "entry_price_cents": ask,
-            "model_probability_proxy": side_probability,
-            "preliminary_edge_points": preliminary_edge,
-            "forecast_probability_change_points": side_probability_change,
-            "market_price_change_points": market_change,
-            "market_lag_points": market_lag,
-            "forecast_temperature_change_f": None,
-            "contract_label": market.get("title") or "",
-        }
-        if best is None or (
-            candidate["market_lag_points"],
-            candidate["preliminary_edge_points"],
-        ) > (
-            best["market_lag_points"],
-            best["preliminary_edge_points"],
-        ):
-            best = candidate
-    return best
-
-
-def signal_fingerprint(signal):
-    raw = "|".join(
-        [
-            signal["market_ticker"],
-            signal["side"],
-            signal["forecast_date"],
-            f"{signal['entry_price_cents']:.2f}",
-            f"{signal['model_probability_proxy']:.2f}",
-            f"{signal['forecast_probability_change_points']:.2f}",
-            f"{signal['market_price_change_points']:.2f}",
-        ]
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()[:24]
-
-
-def open_paper_trade(signal, reason):
-    fp = signal_fingerprint(signal)
-    existing = db_execute(
-        "SELECT 1 FROM paper_trades WHERE signal_fingerprint=%s",
-        (fp,),
-        fetchone=True,
-    )
-    if existing:
-        return fp, False
-
-    entry = signal["entry_price_cents"] / 100.0
-    contracts = PAPER_RISK_DOLLARS / entry
-    db_execute(
-        """
-        INSERT INTO paper_trades(
-            signal_fingerprint,created_at,city,forecast_date,market_ticker,
-            market_kind,side,entry_price_cents,stake_dollars,contracts,
-            model_probability_proxy,preliminary_edge_points,
-            forecast_probability_change_points,market_price_change_points,
-            market_lag_points,forecast_temperature_change_f,reason,status
-        ) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
-        ON CONFLICT(signal_fingerprint) DO NOTHING
-        """,
-        (
-            fp,
-            signal["city"],
-            signal["forecast_date"],
-            signal["market_ticker"],
-            signal["market_kind"],
-            signal["side"],
-            signal["entry_price_cents"],
-            PAPER_RISK_DOLLARS,
-            contracts,
-            signal["model_probability_proxy"],
-            signal["preliminary_edge_points"],
-            signal["forecast_probability_change_points"],
-            signal["market_price_change_points"],
-            signal["market_lag_points"],
-            signal.get("forecast_temperature_change_f"),
-            Json(reason),
-        ),
-    )
-    return fp, True
-
-
-def send_discord(message):
-    if not DISCORD_RELAY_URL or not DISCORD_RELAY_SECRET:
-        log.error("Discord relay is not configured")
-        return False
-    try:
-        response = requests.post(
-            DISCORD_RELAY_URL,
-            json={"secret": DISCORD_RELAY_SECRET, "message": message},
-            headers={"User-Agent": "WeatherKalshiResearchBot/6.0", "Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        log.info("Discord relay response: %s", response.status_code)
-        if not 200 <= response.status_code < 300:
-            log.error("Discord relay error: %s", response.text[:1000])
-            return False
+def paper(signal,reason,stats):
+    fp=h(signal)[:24]
+    if q('SELECT 1 FROM paper_trades WHERE signal_fingerprint=%s',(fp,),one=True):return
+    entry=signal['entry_price_cents']/100;contracts=max(1,int(PAPER_RISK_DOLLARS/entry));stake=contracts*entry
+    q('''INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') ON CONFLICT(signal_fingerprint) DO NOTHING''',(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,Json(reason)));stats['paper_trades_created']+=1
+    if not q('SELECT 1 FROM alert_log WHERE fingerprint=%s',(fp,),one=True):
+        msg=f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\nMarket: `{signal['market_ticker']}`\nSide: **{signal['side']}**\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\n\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\n⚠️ Research only; verify the individual Kalshi market rules before real trading."
         try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-        if payload.get("success") is False:
-            log.error("Discord relay reported failure: %s", payload)
-            return False
-        return True
-    except Exception as exc:
-        log.error("Discord relay exception: %s", exc)
-        return False
+            r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/7.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
+            if r is not None and 200<=r.status_code<300:q('INSERT INTO alert_log(fingerprint,sent_at,payload) VALUES(%s,NOW(),%s) ON CONFLICT DO NOTHING',(fp,Json(signal)));stats['discord_alerts']+=1
+        except Exception as e:log.error('Discord relay failed: %s',e)
 
-
-def signal_message(signal):
-    kind_label = "PRECIPITATION" if signal.get("market_kind") == "precipitation" else "TEMPERATURE"
-    return (
-        f"🌦️ **{kind_label} FORECAST SHOCK — PAPER TRADE**\n\n"
-        f"**{signal['city']} — {signal['forecast_date']}**\n"
-        f"Market: `{signal['market_ticker']}`\n"
-        f"Side: **{signal['side']}**\n"
-        f"Entry ask: **{signal['entry_price_cents']:.1f}¢**\n\n"
-        f"Ensemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n"
-        f"Forecast probability change: **{signal['forecast_probability_change_points']:+.1f} percentage points**\n"
-        f"Market ask change: **{signal['market_price_change_points']:+.1f} percentage points**\n"
-        f"Estimated market lag: **{signal['market_lag_points']:+.1f} percentage points**\n"
-        f"Preliminary edge: **{signal['preliminary_edge_points']:+.1f} percentage points**\n\n"
-        f"Paper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n"
-        "⚠️ Research only. The ensemble value is an uncalibrated frequency proxy. "
-        "For precipitation, Kalshi settles using the official Weather Company data, so Open-Meteo is a forecast proxy, not the settlement feed."
-    )
-
-
-def record_alert(fp, signal):
-    db_execute(
-        """
-        INSERT INTO alert_log(fingerprint,sent_at,payload)
-        VALUES(%s,NOW(),%s)
-        ON CONFLICT(fingerprint) DO NOTHING
-        """,
-        (fp, Json(signal)),
-    )
-
-
-def settle_paper_trades():
-    rows = db_execute(
-        """
-        SELECT id,market_ticker,side,stake_dollars,contracts
-        FROM paper_trades
-        WHERE status='open'
-        ORDER BY created_at ASC
-        LIMIT 200
-        """,
-        fetch=True,
-    )
-    settled = 0
-    for trade_id, ticker, side, stake, contracts in rows:
+def settle(stats):
+    for tid,ticker,side,stake,contracts in q("SELECT id,market_ticker,side,stake_dollars,contracts FROM paper_trades WHERE status='open' LIMIT 200",fetch=True) or []:
         try:
-            data = http_json(f"{KALSHI_API_URL}/markets/{ticker}")
-            market = data.get("market", {}) if isinstance(data, dict) else {}
-            result = (market.get("result") or "").lower()
-            if result not in {"yes", "no"}:
-                continue
-            won = result == side.lower()
-            pnl = contracts - stake if won else -stake
-            db_execute(
-                """
-                UPDATE paper_trades
-                SET settled_at=NOW(),result=%s,profit_loss_dollars=%s,status='settled'
-                WHERE id=%s
-                """,
-                (result, pnl, trade_id),
-            )
-            settled += 1
-            log.info("PAPER TRADE SETTLED | %s | %s | result=%s | P/L=$%.2f", ticker, side, result, pnl)
-        except Exception as exc:
-            log.warning("Could not settle %s: %s", ticker, exc)
-    return settled
+            m=http(f'{KALSHI_API_URL}/markets/{ticker}',tries=1).get('market',{});res=(m.get('result') or '').lower()
+            if res not in {'yes','no'}:continue
+            pnl=contracts-stake if res==side.lower() else -stake;q('UPDATE paper_trades SET settled_at=NOW(),result=%s,profit_loss_dollars=%s,status=\'settled\' WHERE id=%s',(res,pnl,tid));stats['settled_trades']+=1
+        except Exception as e:log.warning('Could not settle %s: %s',ticker,e)
 
-
-def start_scan_run():
-    row = db_execute(
-        """
-        INSERT INTO scan_runs(started_at,status,stats)
-        VALUES(NOW(),'running','{}'::jsonb)
-        RETURNING id
-        """,
-        fetchone=True,
-    )
-    return row[0]
-
-
-def finish_scan_run(scan_id, status, stats, error=None):
-    db_execute(
-        """
-        UPDATE scan_runs
-        SET completed_at=NOW(),status=%s,stats=%s,error=%s
-        WHERE id=%s
-        """,
-        (status, Json(stats), error, scan_id),
-    )
-
-
-def get_series_list():
-    items = []
-    cursor = None
-    while True:
-        params = {"category": "Climate and Weather", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        data = http_json(f"{KALSHI_API_URL}/series", params)
-        items.extend(data.get("series", []))
-        cursor = data.get("cursor")
-        if not cursor:
-            return items
-
-
-def save_series_registry(series_list):
-    # Save all discovered series in one database transaction. The previous
-    # implementation opened a fresh PostgreSQL connection for every series,
-    # which made a 300+ series response unnecessarily slow.
-    rows = []
-    for series in series_list:
-        ticker = series.get("ticker")
-        if not ticker:
-            continue
-        rows.append(
-            (
-                ticker,
-                series.get("title", ""),
-                series.get("category"),
-                Json(series.get("tags") or []),
-                Json(series.get("settlement_sources") or []),
-                series.get("contract_terms_url"),
-                Json(series),
-            )
-        )
-    if not rows:
-        return
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            sql = """
-                INSERT INTO series_registry(
-                    series_ticker,title,category,tags,settlement_sources,
-                    contract_terms_url,updated_at,raw_series
-                ) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s)
-                ON CONFLICT(series_ticker) DO UPDATE SET
-                    title=EXCLUDED.title,
-                    category=EXCLUDED.category,
-                    tags=EXCLUDED.tags,
-                    settlement_sources=EXCLUDED.settlement_sources,
-                    contract_terms_url=EXCLUDED.contract_terms_url,
-                    updated_at=NOW(),
-                    raw_series=EXCLUDED.raw_series
-            """
-            cur.executemany(sql, rows)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def get_series_markets(series_ticker):
-    items = []
-    cursor = None
-    while True:
-        params = {"series_ticker": series_ticker, "status": "open", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        data = http_json(f"{KALSHI_API_URL}/markets", params)
-        items.extend(data.get("markets", []))
-        cursor = data.get("cursor")
-        if not cursor:
-            return items
-
-
-def select_relevant_temperature_series(all_series):
-    # There can be duplicate/legacy series for the same city. For signal
-    # generation and market snapshots, keep one canonical series per city,
-    # preferring the current KXHIGH* ticker family.
-    candidates = defaultdict(list)
-    for series in all_series:
-        if not temperature_series(series):
-            continue
-        location = location_from_title_or_ticker(series)
-        if location is None:
-            continue
-        city = location[0]
-        candidates[city].append(series)
-
-    result = []
-    for city, series_list in sorted(candidates.items()):
-        def rank(series):
-            ticker = (series.get("ticker") or "").upper()
-            return (0 if ticker.startswith("KXHIGH") else 1, ticker)
-        chosen = sorted(series_list, key=rank)[0]
-        result.append(chosen)
-        if len(series_list) > 1:
-            discarded = [s.get("ticker") for s in series_list if s is not chosen]
-            log.info(
-                "Using canonical temperature series for %s: %s | ignoring duplicates: %s",
-                city, chosen.get("ticker"), ", ".join(x or "?" for x in discarded),
-            )
-    return result
-
-
-def insert_market_snapshot(market, city, kind):
-    def cents(value):
-        value = safe_float(value)
-        return None if value is None else value * 100.0
-
-    db_execute(
-        """
-        INSERT INTO market_snapshots(
-            observed_at,ticker,event_ticker,series_ticker,market_date,
-            city,market_kind,strike_type,floor_strike,cap_strike,
-            yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,
-            last_price_cents,status,result
-        ) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (
-            market.get("ticker") or "",
-            market.get("event_ticker"),
-            market.get("series_ticker"),
-            parse_market_date(market),
-            city,
-            kind,
-            market.get("strike_type"),
-            safe_float(market.get("floor_strike")),
-            safe_float(market.get("cap_strike")),
-            cents(market.get("yes_bid_dollars")),
-            cents(market.get("yes_ask_dollars")),
-            cents(market.get("no_bid_dollars")),
-            cents(market.get("no_ask_dollars")),
-            cents(market.get("last_price_dollars")),
-            market.get("status"),
-            market.get("result"),
-        ),
-    )
-
-
-def research_event_fingerprint(city, date_key, variable, ticker, side, forecast_signature):
-    raw = "|".join([city, date_key, variable, ticker, side, forecast_signature])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-
-def record_research_event(city, date_key, variable, market, side, previous_probability, current_probability, previous_market_ask, current_market_ask, forecast_signature, stats):
-    if current_probability is None or previous_probability is None:
-        return
-    forecast_change = current_probability - previous_probability
-    side_forecast_change = forecast_change if side == "YES" else -forecast_change
-    if abs(side_forecast_change) < RESEARCH_MIN_FORECAST_CHANGE_POINTS:
-        return
-    if previous_market_ask is None or current_market_ask is None:
-        return
-
-    ticker = market.get("ticker") or ""
-    side_probability = current_probability if side == "YES" else 100.0 - current_probability
-    initial_market_change = current_market_ask - previous_market_ask
-    initial_lag = side_forecast_change - initial_market_change
-    initial_edge = side_probability - current_market_ask
-    status = "open"
-    fp = research_event_fingerprint(city, date_key, variable, ticker, side, forecast_signature)
-
-    row = db_execute(
-        """
-        INSERT INTO forecast_research_events(
-            event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,
-            previous_probability,current_probability,forecast_probability_change_points,
-            pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,
-            initial_market_lag_points,initial_preliminary_edge_points,status
-        ) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT(event_fingerprint) DO NOTHING
-        RETURNING id
-        """,
-        (
-            fp, city, date_key, variable, ticker, side,
-            previous_probability if side == "YES" else 100.0 - previous_probability,
-            side_probability, side_forecast_change, previous_market_ask, current_market_ask,
-            initial_market_change, initial_lag, initial_edge, status,
-        ),
-        fetchone=True,
-    )
-    if row:
-        stats["research_events_created"] += 1
-        log.info(
-            "RESEARCH EVENT | %s | %s | %s | %s | prob %.1f -> %.1f | market %.1f -> %.1f | lag %.1f pts | edge %.1f pts",
-            variable, city, date_key, ticker,
-            previous_probability if side == "YES" else 100.0 - previous_probability,
-            side_probability, previous_market_ask, current_market_ask, initial_lag, initial_edge,
-        )
-
-
-def record_research_temperature(temp_series, ensemble, stats):
-    for series in temp_series:
-        location = location_from_title_or_ticker(series)
-        if location is None:
-            continue
-        city, _, _, tz_name, _ = location
-        code = next(code for code, entry in LOCATION_MAP.items() if entry == location)
-        markets = get_series_markets(series.get("ticker"))
-        for market in markets:
-            stats["research_markets_considered"] += 1
-            date_key = parse_market_date(market)
-            if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
-                continue
-            daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
-            previous = prior_member_data(code, date_key, "ensemble_temperature_distribution")
-            if not daily:
-                continue
-            if not previous:
-                stats["research_missing_previous_forecast"] += 1
-                continue
-            current_members = daily.get("member_highs") or []
-            previous_members = previous.get("member_highs") or []
-            current_prob = temperature_probability(current_members, market)
-            previous_prob = temperature_probability(previous_members, market)
-            if current_prob is None or previous_prob is None:
-                continue
-            stats["research_current_forecasts"] += 1
-            stats["research_previous_forecasts"] += 1
-            prev_market = latest_market(market.get("ticker") or "")
-            for side in ("YES", "NO"):
-                current_ask = get_side_ask_cents(market, side)
-                previous_ask = None if not prev_market else safe_float(prev_market[2] if side == "YES" else prev_market[4])
-                record_research_event(
-                    city, date_key, "temperature", market, side,
-                    previous_prob, current_prob, previous_ask, current_ask,
-                    payload_hash({"member_highs": current_members}), stats,
-                )
-
-
-def record_research_rain(city_names, ensemble, stats):
-    for market in get_series_markets("KXRAIN"):
-        code = rain_city_from_ticker(market)
-        if code not in city_names:
-            continue
-        city, _, _, tz_name, _ = LOCATION_MAP[code]
-        date_key = parse_market_date(market)
-        if not date_key or date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
-            continue
-        stats["research_markets_considered"] += 1
-        daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
-        previous = prior_rain_member_data(code, date_key)
-        if not daily:
-            continue
-        if not previous:
-            stats["research_missing_previous_forecast"] += 1
-            continue
-        current_members = daily.get("member_precip_totals") or []
-        previous_members = previous.get("member_precip_totals") or []
-        current_prob = rain_probability(current_members)
-        previous_prob = rain_probability(previous_members)
-        if current_prob is None or previous_prob is None:
-            continue
-        stats["research_current_forecasts"] += 1
-        stats["research_previous_forecasts"] += 1
-        prev_market = latest_market(market.get("ticker") or "")
-        for side in ("YES", "NO"):
-            current_ask = get_side_ask_cents(market, side)
-            previous_ask = None if not prev_market else safe_float(prev_market[2] if side == "YES" else prev_market[4])
-            record_research_event(
-                city, date_key, "precipitation", market, side,
-                previous_prob, current_prob, previous_ask, current_ask,
-                payload_hash({"member_precip_totals": current_members}), stats,
-            )
-
-
-def research_observe_market_progress(stats, scan_started_at):
-    rows = db_execute(
-        """
-        SELECT id,city,forecast_date,variable,market_ticker,side,created_at,event_ask_cents,
-               initial_market_lag_points,first_response_at,milestone_25_at,milestone_50_at,
-               milestone_75_at,milestone_90_at,max_market_move_points,latest_observation_at
-        FROM forecast_research_events
-        WHERE status='open'
-          AND created_at < %s
-        ORDER BY created_at ASC
-        LIMIT 1000
-        """,
-        (scan_started_at,),
-        fetch=True,
-    ) or []
-    for row in rows:
-        (event_id, city, forecast_date, variable, ticker, side, created_at, event_ask,
-         initial_lag, first_response_at, m25, m50, m75, m90, max_move, latest_observed_at) = row
-        if initial_lag is None or event_ask is None:
-            continue
-        after = latest_observed_at or created_at
-        snapshot = db_execute(
-            """
-            SELECT observed_at,
-                   CASE WHEN %s='YES' THEN yes_ask_cents ELSE no_ask_cents END
-            FROM market_snapshots
-            WHERE ticker=%s AND observed_at>%s AND observed_at<%s
-            ORDER BY observed_at ASC
-            LIMIT 1
-            """,
-            (side, ticker, after, scan_started_at), fetchone=True,
-        )
-        if not snapshot or snapshot[1] is None:
-            continue
-        observed_at, current_ask = snapshot
-        market_move = current_ask - event_ask
-        # Measure response in the forecast-change direction. Initial lag may be
-        # zero/negative; such events remain in the research table but do not
-        # get milestone timing until a positive initial gap exists.
-        response_fraction = (market_move / initial_lag) if initial_lag > 0 else 0.0
-        lag_remaining = initial_lag - market_move
-        max_move_new = max(max_move or 0.0, market_move)
-        db_execute(
-            """
-            INSERT INTO forecast_research_updates(
-                event_id,observed_at,market_ask_cents,market_move_points,
-                lag_remaining_points,market_response_fraction
-            ) VALUES(%s,%s,%s,%s,%s,%s)
-            """,
-            (event_id, observed_at, current_ask, market_move, lag_remaining, response_fraction),
-        )
-        updates = {
-            "latest_observation_at": observed_at,
-            "latest_ask_cents": current_ask,
-            "latest_market_move_points": market_move,
-            "latest_lag_remaining_points": lag_remaining,
-            "max_market_move_points": max_move_new,
-        }
-        # First response is directional: a YES event responds when YES ask rises;
-        # a NO event responds when NO ask rises.
-        if first_response_at is None and market_move > 0:
-            updates["first_response_at"] = observed_at
-        if initial_lag > 0:
-            for fraction, column, existing in (
-                (0.25, "milestone_25_at", m25),
-                (0.50, "milestone_50_at", m50),
-                (0.75, "milestone_75_at", m75),
-                (0.90, "milestone_90_at", m90),
-            ):
-                if existing is None and market_move >= initial_lag * fraction:
-                    updates[column] = observed_at
-                    if fraction == 0.90:
-                        log.info(
-                            "RESEARCH ADAPTED 90%% | %s | %s | %s | %.1fs",
-                            variable, city, ticker, (observed_at-created_at).total_seconds()
-                        )
-        assignments = [f"{k}=%s" for k in updates]
-        db_execute(
-            f"UPDATE forecast_research_events SET {', '.join(assignments)} WHERE id=%s",
-            tuple(list(updates.values()) + [event_id]),
-        )
-        stats["research_events_observed"] += 1
-
-
-def process_temperature_signals(temp_series, ensemble, stats):
-    for series in temp_series:
-        location = location_from_title_or_ticker(series)
-        if location is None:
-            continue
-        city, _, _, tz_name, _ = location
-        code = next(code for code, entry in LOCATION_MAP.items() if entry == location)
-        if not location_signal_allowed(location):
-            continue
-
-        markets = get_series_markets(series.get("ticker"))
-        for market in markets:
-            date_key = parse_market_date(market)
-            if not date_key:
-                continue
-            today = datetime.now(ZoneInfo(tz_name)).date().isoformat()
-            if date_key < today:
-                continue
-
-            current_daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
-            if not current_daily:
-                continue
-            current_members = current_daily.get("member_highs") or []
-            previous = prior_member_data(code, date_key, "ensemble_temperature_distribution")
-            previous_members = (previous or {}).get("member_highs") or []
-            if not previous_members:
-                continue
-
-            current_prob = temperature_probability(current_members, market)
-            previous_prob = temperature_probability(previous_members, market)
-            signal = build_candidate(city, date_key, market, current_prob, previous_prob)
-            if not signal:
-                continue
-
-            stats["forecast_shocks"] += 1
-            reason = {
-                "contract": market.get("title") or market.get("ticker"),
-                "ensemble_model": ENSEMBLE_MODEL,
-                "current_member_count": len(current_members),
-                "previous_member_count": len(previous_members),
-                "settlement_source_note": "Verify active Kalshi market rules before treating coordinates as settlement-equivalent.",
-            }
-            fp, created = open_paper_trade(signal, reason)
-            if not created:
-                continue
-            stats["paper_trades_created"] += 1
-
-            if not db_execute(
-                "SELECT 1 FROM alert_log WHERE fingerprint=%s", (fp,), fetchone=True
-            ):
-                if send_discord(signal_message(signal)):
-                    record_alert(fp, signal)
-                    stats["discord_alerts"] += 1
-                else:
-                    log.error("Paper trade %s created but Discord alert failed", fp)
-
-            log.info(
-                "FORECAST SHOCK | %s | %s | %s | prob %.1f -> %.1f | market lag %.1f pts | edge %.1f pts",
-                city,
-                date_key,
-                market.get("ticker"),
-                previous_prob,
-                current_prob,
-                signal["market_lag_points"],
-                signal["preliminary_edge_points"],
-            )
-
-
-def process_rain_signals(city_names, ensemble, stats):
-    """Evaluate KXRAIN daily >0.00 inch outcomes for forecast shocks."""
-    markets_by_city = defaultdict(list)
-    for market in get_series_markets("KXRAIN"):
-        code = rain_city_from_ticker(market)
-        if code in city_names:
-            markets_by_city[code].append(market)
-
-    for code in city_names:
-        if code not in RAIN_SIGNAL_CODES:
-            continue
-        location = LOCATION_MAP[code]
-        city, _, _, tz_name, _ = location
-        for market in markets_by_city.get(code, []):
-            date_key = parse_market_date(market)
-            if not date_key:
-                continue
-            if date_key < datetime.now(ZoneInfo(tz_name)).date().isoformat():
-                continue
-
-            current_daily = ensemble.get(code, {}).get("daily", {}).get(date_key)
-            if not current_daily:
-                continue
-            current_members = current_daily.get("member_precip_totals") or []
-            previous = prior_rain_member_data(code, date_key)
-            previous_members = (previous or {}).get("member_precip_totals") or []
-            if not previous_members:
-                continue
-
-            current_prob = rain_probability(current_members)
-            previous_prob = rain_probability(previous_members)
-            signal = build_rain_candidate(city, date_key, market, current_prob, previous_prob)
-            if not signal:
-                continue
-
-            stats["forecast_shocks"] += 1
-            stats["rain_forecast_shocks"] += 1
-            reason = {
-                "contract": market.get("title") or market.get("ticker"),
-                "market_kind": "precipitation",
-                "rain_rule": "YES if total daily precipitation is strictly greater than 0 inches; trace and missing daily values count as 0.",
-                "ensemble_model": ENSEMBLE_MODEL,
-                "current_member_count": len(current_members),
-                "previous_member_count": len(previous_members),
-                "current_precip_mean_inches": statistics.mean(current_members),
-                "previous_precip_mean_inches": statistics.mean(previous_members),
-                "settlement_source_note": "Kalshi weather rules use the official Weather Company source; Open-Meteo is a forecast proxy and is not settlement-equivalent.",
-            }
-            fp, created = open_paper_trade(signal, reason)
-            if not created:
-                continue
-            stats["paper_trades_created"] += 1
-
-            if not db_execute("SELECT 1 FROM alert_log WHERE fingerprint=%s", (fp,), fetchone=True):
-                if send_discord(signal_message(signal)):
-                    record_alert(fp, signal)
-                    stats["discord_alerts"] += 1
-                else:
-                    log.error("Paper trade %s created but Discord alert failed", fp)
-
-            log.info(
-                "RAIN FORECAST SHOCK | %s | %s | %s | prob %.1f -> %.1f | market lag %.1f pts | edge %.1f pts",
-                city, date_key, market.get("ticker"), previous_prob, current_prob,
-                signal["market_lag_points"], signal["preliminary_edge_points"],
-            )
-
-
-def collect_market_snapshots(temp_series, stats, city_names):
-    for series in temp_series:
-        location = location_from_title_or_ticker(series)
-        if location is None:
-            continue
-        city = location[0]
-        markets = get_series_markets(series.get("ticker"))
-        stats["temperature_markets"] += len(markets)
-        for market in markets:
-            insert_market_snapshot(market, city, "temperature")
-
-    for market in get_series_markets("KXRAIN"):
-        code = rain_city_from_ticker(market)
-        if not code or code not in city_names:
-            continue
-        city = LOCATION_MAP[code][0]
-        stats["rain_markets"] += 1
-        insert_market_snapshot(market, city, "precipitation")
-
+def observe(stats,before):
+    rows=q("SELECT id,market_ticker,side,created_at,event_ask_cents,initial_market_lag_points,latest_observation_at,max_market_move_points FROM forecast_research_events WHERE measurement_version=%s AND status='open' AND created_at<%s LIMIT 1000",(MEASUREMENT_VERSION,before),fetch=True) or []
+    for eid,ticker,side,created,event,lag,last,maxmove in rows:
+        r=q("SELECT observed_at,CASE WHEN %s='YES' THEN yes_ask_cents ELSE no_ask_cents END FROM market_snapshots WHERE ticker=%s AND snapshot_phase='scan_start' AND measurement_version=%s AND observed_at>%s AND observed_at<%s ORDER BY observed_at LIMIT 1",(side,ticker,MEASUREMENT_VERSION,last or created,before),one=True)
+        if not r or r[1] is None:continue
+        move=r[1]-event;frac=move/lag if lag and lag>0 else 0;remaining=lag-move if lag is not None else None
+        q('''UPDATE forecast_research_events SET latest_observation_at=%s,latest_ask_cents=%s,latest_market_move_points=%s,latest_lag_remaining_points=%s,max_market_move_points=%s,first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END WHERE id=%s''',(r[0],r[1],move,remaining,max(maxmove or 0,move),move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],eid));q('INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction) VALUES(%s,%s,%s,%s,%s,%s)',(eid,r[0],r[1],move,remaining,frac));stats['research_events_observed']+=1
 
 def run_scan():
-    scan_id = None
-    stats = {
-        "temperature_series": 0,
-        "temperature_markets": 0,
-        "weather_refreshed": False,
-        "forecast_shocks": 0,
-        "paper_trades_created": 0,
-        "discord_alerts": 0,
-        "settled_trades": 0,
-        "deterministic_gfs_ok": False,
-        "ensemble_ok": False,
-        "rain_signals_enabled": True,
-        "rain_markets": 0,
-        "rain_forecast_shocks": 0,
-        "research_events_created": 0,
-        "research_events_observed": 0,
-        "research_markets_considered": 0,
-        "research_current_forecasts": 0,
-        "research_previous_forecasts": 0,
-        "research_missing_previous_forecast": 0,
-        "nws_updates_detected": 0,
-    }
-    started = time.time()
-    scan_started_at = utc_now()
-
-    log.info("=" * 50)
-    log.info("STARTING WEATHER MARKET SCAN")
-    log.info("UTC: %s", utc_now().isoformat())
-    log.info("ENSEMBLE_MODEL: %s", ENSEMBLE_MODEL)
-    log.info("DETERMINISTIC_MODEL: %s", DETERMINISTIC_MODEL)
-    log.info("=" * 50)
-
+    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'nws_updates_detected':0}
+    started=now();
     try:
-        ensure_schema()
-        scan_id = start_scan_run()
-        stats["settled_trades"] = settle_paper_trades()
-
-        all_series = get_series_list()
-        registry_started = time.time()
-        save_series_registry(all_series)
-        log.info("Series registry saved: %d series in %.1fs", len(all_series), time.time() - registry_started)
-        temp_series = select_relevant_temperature_series(all_series)
-        stats["temperature_series"] = len(temp_series)
-        log.info("Relevant temperature series: %d", len(temp_series))
-
-        city_names = sorted({location_from_title_or_ticker(s)[0] for s in temp_series if location_from_title_or_ticker(s)})
-        if not city_names:
-            raise RuntimeError("No monitored temperature market locations were discovered")
-        # Convert display names back to LOCATION_MAP keys.
-        city_names = sorted({next(code for code, entry in LOCATION_MAP.items() if entry[0] == name) for name in city_names})
-        log.info("Forecast cities: %s", ", ".join(city_names))
-
-        try:
-            nws_updates, changed_updates = detect_nws_updates(city_names)
-            stats["nws_updates_detected"] = len(changed_updates)
-            for code in city_names:
-                updated_at = nws_updates.get(code)
-                if updated_at is None:
-                    log.info("NWS %s forecast update: unavailable this scan", code)
-                    continue
-                log.info("NWS %s forecast update: %s%s", code, updated_at.isoformat(), " (NEW)" if code in changed_updates else "")
-        except Exception as exc:
-            # NWS is the refresh trigger, not a reason to stop market monitoring.
-            # If NWS is temporarily unavailable everywhere, continue the scan and
-            # let the next five-minute run try again.
-            log.warning("NWS update check unavailable this scan; continuing market monitoring: %s", exc)
-            nws_updates = {}
-            changed_updates = {}
-
-        refresh_weather = bool(changed_updates)
-        log.info("New NWS forecast detected: %s", refresh_weather)
-        if changed_updates:
-            log.info("NWS update cities: %s", ", ".join(sorted(changed_updates)))
-
-        if refresh_weather:
-            stats["weather_refreshed"] = True
-
-            deterministic = {}
-            try:
-                deterministic[DETERMINISTIC_MODEL] = fetch_gfs_deterministic(city_names)
-                stats["deterministic_gfs_ok"] = True
-                log.info("Deterministic GFS fetched successfully")
-            except Exception as exc:
-                log.warning("Deterministic GFS unavailable; continuing with ensemble: %s", exc)
-
-            ensemble = fetch_ensemble(city_names)
-            stats["ensemble_ok"] = True
-
-            process_temperature_signals(temp_series, ensemble, stats)
-            process_rain_signals(city_names, ensemble, stats)
-            record_research_temperature(temp_series, ensemble, stats)
-            record_research_rain(city_names, ensemble, stats)
-
-            save_weather_forecasts(deterministic, ensemble)
-            save_nws_state(nws_updates)
-        else:
-            ensemble = {}
-
-        # Market snapshots happen every scan, including scans without a new weather run.
-        collect_market_snapshots(temp_series, stats, city_names)
-        research_observe_market_progress(stats, scan_started_at)
-        stats["settled_trades"] += settle_paper_trades()
-        finish_scan_run(scan_id, "success", stats)
-        log.info(
-            "RESEARCH | markets=%d | current_forecasts=%d | previous_forecasts=%d | events_created=%d | events_observed=%d | missing_previous=%d",
-            stats["research_markets_considered"],
-            stats["research_current_forecasts"],
-            stats["research_previous_forecasts"],
-            stats["research_events_created"],
-            stats["research_events_observed"],
-            stats["research_missing_previous_forecast"],
-        )
-        log.info("SCAN COMPLETE | %s | runtime=%.1fs", json.dumps(stats, default=str), time.time() - started)
-    except Exception as exc:
-        log.exception("SCAN FAILED")
-        if scan_id is not None:
-            try:
-                finish_scan_run(scan_id, "failed", stats, str(exc))
-            except Exception:
-                log.exception("Could not record scan failure")
+        schema();scan=q("INSERT INTO scan_runs(started_at,status,stats,schema_version) VALUES(NOW(),'running','{}'::jsonb,%s) RETURNING id",(SCHEMA_VERSION,),one=True)[0];settle(stats)
+        xs=series_list();save_series(xs);te,re=discover(xs);stats['temperature_series']=len(te);stats['rain_series']=len(re);stats['weather_locations_discovered']=q('SELECT COUNT(*) FROM weather_locations',one=True)[0]
+        c={'temperature':cache(te),'rain':cache(re)};snapshot(c,scan,'scan_start',stats)
+        locs={l['location_key']:l for _,l in te+re};us,ch=nws_updates(list(locs.values()));stats['nws_updates_detected']=len(ch)
+        if ch:
+            stats['weather_refreshed']=True
+            try:det=fetch_det(list(locs.values()));stats['deterministic_gfs_ok']=True
+            except Exception as e:log.warning('Deterministic GFS unavailable: %s',e);det={}
+            ens=fetch_ens(list(locs.values()));stats['ensemble_ok']=True;observed=now();snapshot(c,scan,'forecast_event',stats)
+            process_research(c,ens,started,scan,observed,stats)
+            for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
+                for s,l,ms in entries:
+                    if not l['settlement_verified'] and not ALLOW_UNVERIFIED_LOCATION_SIGNALS:continue
+                    for m in ms:
+                        date=date_market(m);d=ens.get(l['location_key'],{}).get('daily',{}).get(date or '')
+                        if not d:continue
+                        cur=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];prev=forecast_prev(l['city_name'],'ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution',date,started)
+                        if not prev:continue
+                        old=prev.get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];cp=tprob(cur,m) if kind=='temperature' else rprob(cur);pp=tprob(old,m) if kind=='temperature' else rprob(old);pm=prior_market(m.get('ticker',''),started);em=event_market(m.get('ticker',''),scan);sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
+                        if sig:paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'ensemble_model':ENSEMBLE_MODEL},stats)
+            save_forecasts(det,ens,observed);save_nws(us,locs)
+        observe(stats,started);settle(stats)
+        q('UPDATE scan_runs SET completed_at=NOW(),status=\'success\',stats=%s,schema_version=%s WHERE id=%s',(Json(stats),SCHEMA_VERSION,scan));log.info('SCAN COMPLETE | %s | runtime=%.1fs',json.dumps(stats,default=str), (now()-started).total_seconds())
+    except Exception as e:
+        log.exception('SCAN FAILED')
+        if scan:
+            q('UPDATE scan_runs SET completed_at=NOW(),status=\'failed\',stats=%s,error=%s,schema_version=%s WHERE id=%s',(Json(stats),str(e),SCHEMA_VERSION,scan))
         raise
-    finally:
-        db_close()
+    finally:close_db()
 
-
-if __name__ == "__main__":
-    run_scan()
+if __name__=='__main__':run_scan()
