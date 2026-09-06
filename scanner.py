@@ -79,7 +79,7 @@ def schema():
     for s in [
 '''CREATE TABLE IF NOT EXISTS scan_runs(id BIGSERIAL PRIMARY KEY,started_at TIMESTAMPTZ NOT NULL,completed_at TIMESTAMPTZ,status TEXT NOT NULL,stats JSONB NOT NULL DEFAULT '{}'::jsonb,error TEXT)''',
 '''CREATE TABLE IF NOT EXISTS series_registry(series_ticker TEXT PRIMARY KEY,title TEXT NOT NULL,category TEXT,tags JSONB NOT NULL,settlement_sources JSONB NOT NULL,contract_terms_url TEXT,updated_at TIMESTAMPTZ NOT NULL,raw_series JSONB NOT NULL)''',
-'''CREATE TABLE IF NOT EXISTS weather_service_state(service TEXT NOT NULL,city TEXT NOT NULL,state_key TEXT NOT NULL,last_update_at TIMESTAMPTZ,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(service,city,state_key))''',
+'''CREATE TABLE IF NOT EXISTS weather_service_state(city_code TEXT PRIMARY KEY,source TEXT NOT NULL,last_update_at TIMESTAMPTZ,checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''',
 '''CREATE TABLE IF NOT EXISTS forecast_observations(id BIGSERIAL PRIMARY KEY,observed_at TIMESTAMPTZ NOT NULL,city TEXT NOT NULL,variable TEXT NOT NULL,model TEXT NOT NULL,forecast_date DATE NOT NULL,scalar_value DOUBLE PRECISION,payload JSONB NOT NULL,payload_hash TEXT NOT NULL,UNIQUE(city,variable,model,forecast_date,payload_hash))''',
 '''CREATE TABLE IF NOT EXISTS market_snapshots(id BIGSERIAL PRIMARY KEY,observed_at TIMESTAMPTZ NOT NULL,ticker TEXT NOT NULL,event_ticker TEXT,series_ticker TEXT,market_date DATE,city TEXT,market_kind TEXT NOT NULL,strike_type TEXT,floor_strike DOUBLE PRECISION,cap_strike DOUBLE PRECISION,yes_bid_cents DOUBLE PRECISION,yes_ask_cents DOUBLE PRECISION,no_bid_cents DOUBLE PRECISION,no_ask_cents DOUBLE PRECISION,last_price_cents DOUBLE PRECISION,status TEXT,result TEXT)''',
 '''CREATE TABLE IF NOT EXISTS paper_trades(id BIGSERIAL PRIMARY KEY,signal_fingerprint TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ NOT NULL,settled_at TIMESTAMPTZ,city TEXT NOT NULL,forecast_date DATE NOT NULL,market_ticker TEXT NOT NULL,market_kind TEXT NOT NULL,side TEXT NOT NULL,entry_price_cents DOUBLE PRECISION NOT NULL,stake_dollars DOUBLE PRECISION NOT NULL,contracts DOUBLE PRECISION NOT NULL,model_probability_proxy DOUBLE PRECISION NOT NULL,preliminary_edge_points DOUBLE PRECISION NOT NULL,forecast_probability_change_points DOUBLE PRECISION NOT NULL,market_price_change_points DOUBLE PRECISION NOT NULL,market_lag_points DOUBLE PRECISION NOT NULL,forecast_temperature_change_f DOUBLE PRECISION,reason JSONB NOT NULL,result TEXT,profit_loss_dollars DOUBLE PRECISION,status TEXT NOT NULL DEFAULT 'open')''',
@@ -155,6 +155,12 @@ def loc_for(s):
     if r:return rowloc(r)
     g=geocode(city)
     if not g:return None
+    feature=str(g.get('feature_code') or '').upper()
+    # Dynamic mappings are research-only unless they look like a populated place.
+    # This prevents non-city Kalshi titles from becoming weather locations.
+    if not feature.startswith('PPL'):
+        log.warning('Skipping non-populated-place geocode for %s: %s (%s)', city, g.get('name'), feature)
+        return None
     k=slug(g.get('name') or city)
     q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),Json(g)))
     return getloc(k)
@@ -178,9 +184,12 @@ def discover(xs):
     temps=[]
     for k,es in sorted(by.items()):
         es.sort(key=lambda z:(0 if (z[0].get('ticker') or '').upper().startswith('KXHIGH') else 1,z[0].get('ticker') or ''));temps.append(es[0])
+    unique_rains=[]
     for e in rains:
-        if e[0].get('ticker') not in seen_r:seen_r.add(e[0].get('ticker'));seen_t.add(e[0].get('ticker')); 
-    rains=[e for e in rains if e[0].get('ticker') in seen_r]
+        ticker=e[0].get('ticker')
+        if ticker and ticker not in seen_r:
+            seen_r.add(ticker); unique_rains.append(e)
+    rains=unique_rains
     return temps,rains
 
 def markets(ticker):
@@ -252,14 +261,14 @@ def nws_updates(locations):
             d=nws(url);u=(d.get('properties') or {}).get('updateTime')
             if not u:continue
             dt=datetime.fromisoformat(u.replace('Z','+00:00'));out[l['location_key']]=dt
-            r=q("SELECT last_update_at FROM weather_service_state WHERE service='NWS_GRID' AND city=%s AND state_key=%s",(l['city_name'],l['location_key']),one=True)
+            r=q("SELECT last_update_at FROM weather_service_state WHERE city_code=%s AND source='nws'",(l['location_key'],),one=True)
             if not r or not r[0] or dt>r[0]:changed[l['location_key']]=dt
         except Exception as e:log.warning('NWS update unavailable for %s: %s',l['city_name'],e)
     return out,changed
 def save_nws(us,locs):
     for k,u in us.items():
         l=locs.get(k)
-        if l:q('''INSERT INTO weather_service_state(service,city,state_key,last_update_at,updated_at) VALUES('NWS_GRID',%s,%s,%s,NOW()) ON CONFLICT(service,city,state_key) DO UPDATE SET last_update_at=EXCLUDED.last_update_at,updated_at=NOW()''',(l['city_name'],k,u))
+        if l:q('''INSERT INTO weather_service_state(city_code,source,last_update_at,checked_at) VALUES(%s,'nws',%s,NOW()) ON CONFLICT(city_code) DO UPDATE SET source='nws',last_update_at=EXCLUDED.last_update_at,checked_at=NOW()''',(k,u))
 
 def norm(data,locs):
     rows=data if isinstance(data,list) else [data]
@@ -354,6 +363,18 @@ def settle(stats):
             pnl=contracts-stake if res==side.lower() else -stake;q('UPDATE paper_trades SET settled_at=NOW(),result=%s,profit_loss_dollars=%s,status=\'settled\' WHERE id=%s',(res,pnl,tid));stats['settled_trades']+=1
         except Exception as e:log.warning('Could not settle %s: %s',ticker,e)
 
+def close_research_events(stats):
+    rows=q("SELECT id,market_ticker FROM forecast_research_events WHERE measurement_version=%s AND status IN ('open','no_initial_lag') LIMIT 1000",(MEASUREMENT_VERSION,),fetch=True) or []
+    for eid,ticker in rows:
+        try:
+            m=http(f'{KALSHI_API_URL}/markets/{ticker}',tries=1).get('market',{})
+            res=(m.get('result') or '').lower()
+            if res in {'yes','no'}:
+                q("UPDATE forecast_research_events SET status='settled',closed_at=NOW(),settlement_result=%s WHERE id=%s AND status IN ('open','no_initial_lag')",(res,eid))
+                stats['research_events_settled']=stats.get('research_events_settled',0)+1
+        except Exception as e:
+            log.warning('Could not settle research event %s/%s: %s',eid,ticker,e)
+
 def observe(stats,before):
     rows=q("SELECT id,market_ticker,side,created_at,event_ask_cents,initial_market_lag_points,latest_observation_at,max_market_move_points FROM forecast_research_events WHERE measurement_version=%s AND status='open' AND created_at<%s LIMIT 1000",(MEASUREMENT_VERSION,before),fetch=True) or []
     for eid,ticker,side,created,event,lag,last,maxmove in rows:
@@ -363,7 +384,7 @@ def observe(stats,before):
         q('''UPDATE forecast_research_events SET latest_observation_at=%s,latest_ask_cents=%s,latest_market_move_points=%s,latest_lag_remaining_points=%s,max_market_move_points=%s,first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END WHERE id=%s''',(r[0],r[1],move,remaining,max(maxmove or 0,move),move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],eid));q('INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction) VALUES(%s,%s,%s,%s,%s,%s)',(eid,r[0],r[1],move,remaining,frac));stats['research_events_observed']+=1
 
 def run_scan():
-    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'nws_updates_detected':0}
+    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_events_settled':0,'nws_updates_detected':0}
     started=now();
     try:
         schema();scan=q("INSERT INTO scan_runs(started_at,status,stats,schema_version) VALUES(NOW(),'running','{}'::jsonb,%s) RETURNING id",(SCHEMA_VERSION,),one=True)[0];settle(stats)
@@ -371,12 +392,21 @@ def run_scan():
         c={'temperature':cache(te),'rain':cache(re)};snapshot(c,scan,'scan_start',stats)
         locs={l['location_key']:l for _,l in te+re};us,ch=nws_updates(list(locs.values()));stats['nws_updates_detected']=len(ch)
         if ch:
-            stats['weather_refreshed']=True
+            stats['weather_refreshed']=False
             try:det=fetch_det(list(locs.values()));stats['deterministic_gfs_ok']=True
             except Exception as e:log.warning('Deterministic GFS unavailable: %s',e);det={}
-            ens=fetch_ens(list(locs.values()));stats['ensemble_ok']=True;observed=now();snapshot(c,scan,'forecast_event',stats)
-            process_research(c,ens,started,scan,observed,stats)
+            try:
+                ens=fetch_ens(list(locs.values()));stats['ensemble_ok']=True
+            except Exception as e:
+                log.warning('Ensemble forecast unavailable: %s',e);ens={}
+            observed=now()
+            if ens:
+                stats['weather_refreshed']=True
+                snapshot(c,scan,'forecast_event',stats)
+                process_research(c,ens,started,scan,observed,stats)
             for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
+                if not ens:
+                    break
                 if kind=='rain' and not ALLOW_RAIN_PAPER_SIGNALS:
                     continue
                 for s,l,ms in entries:
@@ -388,8 +418,10 @@ def run_scan():
                         if not prev:continue
                         old=prev.get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];cp=tprob(cur,m) if kind=='temperature' else rprob(cur);pp=tprob(old,m) if kind=='temperature' else rprob(old);pm=prior_market(m.get('ticker',''),started);em=event_market(m.get('ticker',''),scan);sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
                         if sig:paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'ensemble_model':ENSEMBLE_MODEL},stats)
-            save_forecasts(det,ens,observed);save_nws(us,locs)
-        observe(stats,started);settle(stats)
+            if ens:
+                save_forecasts(det,ens,observed)
+                save_nws(us,locs)
+        observe(stats,started);close_research_events(stats);settle(stats)
         q('UPDATE scan_runs SET completed_at=NOW(),status=\'success\',stats=%s,schema_version=%s WHERE id=%s',(Json(stats),SCHEMA_VERSION,scan));log.info('SCAN COMPLETE | %s | runtime=%.1fs',json.dumps(stats,default=str), (now()-started).total_seconds())
     except Exception as e:
         log.exception('SCAN FAILED')
