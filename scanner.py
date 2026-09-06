@@ -29,6 +29,7 @@ MAX_ENTRY_PRICE_CENTS=float(os.environ.get('MAX_ENTRY_PRICE_CENTS','95'))
 PAPER_RISK_DOLLARS=float(os.environ.get('PAPER_RISK_DOLLARS','10'))
 RESEARCH_MIN_FORECAST_CHANGE_POINTS=float(os.environ.get('RESEARCH_MIN_FORECAST_CHANGE_POINTS','3'))
 ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGNALS','false').lower() in {'1','true','yes'}
+ALLOW_RAIN_PAPER_SIGNALS=os.environ.get('ALLOW_RAIN_PAPER_SIGNALS','false').lower() in {'1','true','yes'}
 KNOWN={'NYC':('New York City',40.7789,-73.9692,'America/New_York',True),'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',False),'MIA':('Miami',25.7959,-80.2870,'America/New_York',False),'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False)}
 logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('weather-kalshi-scanner'); _DB_CONN=None
 
@@ -304,6 +305,7 @@ def process_research(cache,ens,before,scan,observed,stats):
     for kind,keyvar,probfun in [('temperature','ensemble_temperature_distribution',tprob),('rain','ensemble_rain_distribution',rprob)]:
         for s,l,ms in cache[kind]:
             for m in ms:
+                stats['research_markets_considered']+=1
                 date=date_market(m)
                 if not date:continue
                 d=ens.get(l['location_key'],{}).get('daily',{}).get(date)
@@ -375,6 +377,8 @@ def run_scan():
             ens=fetch_ens(list(locs.values()));stats['ensemble_ok']=True;observed=now();snapshot(c,scan,'forecast_event',stats)
             process_research(c,ens,started,scan,observed,stats)
             for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
+                if kind=='rain' and not ALLOW_RAIN_PAPER_SIGNALS:
+                    continue
                 for s,l,ms in entries:
                     if not l['settlement_verified'] and not ALLOW_UNVERIFIED_LOCATION_SIGNALS:continue
                     for m in ms:
