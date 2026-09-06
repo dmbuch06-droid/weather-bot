@@ -79,7 +79,7 @@ def schema():
     for s in [
 '''CREATE TABLE IF NOT EXISTS scan_runs(id BIGSERIAL PRIMARY KEY,started_at TIMESTAMPTZ NOT NULL,completed_at TIMESTAMPTZ,status TEXT NOT NULL,stats JSONB NOT NULL DEFAULT '{}'::jsonb,error TEXT)''',
 '''CREATE TABLE IF NOT EXISTS series_registry(series_ticker TEXT PRIMARY KEY,title TEXT NOT NULL,category TEXT,tags JSONB NOT NULL,settlement_sources JSONB NOT NULL,contract_terms_url TEXT,updated_at TIMESTAMPTZ NOT NULL,raw_series JSONB NOT NULL)''',
-'''CREATE TABLE IF NOT EXISTS weather_service_state(service TEXT NOT NULL,city TEXT NOT NULL,state_key TEXT NOT NULL,last_update TIMESTAMPTZ,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(service,city,state_key))''',
+'''CREATE TABLE IF NOT EXISTS weather_service_state(service TEXT NOT NULL,city TEXT NOT NULL,state_key TEXT NOT NULL,last_update_at TIMESTAMPTZ,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(service,city,state_key))''',
 '''CREATE TABLE IF NOT EXISTS forecast_observations(id BIGSERIAL PRIMARY KEY,observed_at TIMESTAMPTZ NOT NULL,city TEXT NOT NULL,variable TEXT NOT NULL,model TEXT NOT NULL,forecast_date DATE NOT NULL,scalar_value DOUBLE PRECISION,payload JSONB NOT NULL,payload_hash TEXT NOT NULL,UNIQUE(city,variable,model,forecast_date,payload_hash))''',
 '''CREATE TABLE IF NOT EXISTS market_snapshots(id BIGSERIAL PRIMARY KEY,observed_at TIMESTAMPTZ NOT NULL,ticker TEXT NOT NULL,event_ticker TEXT,series_ticker TEXT,market_date DATE,city TEXT,market_kind TEXT NOT NULL,strike_type TEXT,floor_strike DOUBLE PRECISION,cap_strike DOUBLE PRECISION,yes_bid_cents DOUBLE PRECISION,yes_ask_cents DOUBLE PRECISION,no_bid_cents DOUBLE PRECISION,no_ask_cents DOUBLE PRECISION,last_price_cents DOUBLE PRECISION,status TEXT,result TEXT)''',
 '''CREATE TABLE IF NOT EXISTS paper_trades(id BIGSERIAL PRIMARY KEY,signal_fingerprint TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ NOT NULL,settled_at TIMESTAMPTZ,city TEXT NOT NULL,forecast_date DATE NOT NULL,market_ticker TEXT NOT NULL,market_kind TEXT NOT NULL,side TEXT NOT NULL,entry_price_cents DOUBLE PRECISION NOT NULL,stake_dollars DOUBLE PRECISION NOT NULL,contracts DOUBLE PRECISION NOT NULL,model_probability_proxy DOUBLE PRECISION NOT NULL,preliminary_edge_points DOUBLE PRECISION NOT NULL,forecast_probability_change_points DOUBLE PRECISION NOT NULL,market_price_change_points DOUBLE PRECISION NOT NULL,market_lag_points DOUBLE PRECISION NOT NULL,forecast_temperature_change_f DOUBLE PRECISION,reason JSONB NOT NULL,result TEXT,profit_loss_dollars DOUBLE PRECISION,status TEXT NOT NULL DEFAULT 'open')''',
@@ -252,14 +252,14 @@ def nws_updates(locations):
             d=nws(url);u=(d.get('properties') or {}).get('updateTime')
             if not u:continue
             dt=datetime.fromisoformat(u.replace('Z','+00:00'));out[l['location_key']]=dt
-            r=q("SELECT last_update FROM weather_service_state WHERE service='NWS_GRID' AND city=%s AND state_key=%s",(l['city_name'],l['location_key']),one=True)
+            r=q("SELECT last_update_at FROM weather_service_state WHERE service='NWS_GRID' AND city=%s AND state_key=%s",(l['city_name'],l['location_key']),one=True)
             if not r or not r[0] or dt>r[0]:changed[l['location_key']]=dt
         except Exception as e:log.warning('NWS update unavailable for %s: %s',l['city_name'],e)
     return out,changed
 def save_nws(us,locs):
     for k,u in us.items():
         l=locs.get(k)
-        if l:q('''INSERT INTO weather_service_state(service,city,state_key,last_update,updated_at) VALUES('NWS_GRID',%s,%s,%s,NOW()) ON CONFLICT(service,city,state_key) DO UPDATE SET last_update=EXCLUDED.last_update,updated_at=NOW()''',(l['city_name'],k,u))
+        if l:q('''INSERT INTO weather_service_state(service,city,state_key,last_update_at,updated_at) VALUES('NWS_GRID',%s,%s,%s,NOW()) ON CONFLICT(service,city,state_key) DO UPDATE SET last_update_at=EXCLUDED.last_update_at,updated_at=NOW()''',(l['city_name'],k,u))
 
 def norm(data,locs):
     rows=data if isinstance(data,list) else [data]
