@@ -179,14 +179,7 @@ def build_research_report():
                     COUNT(*) FILTER (WHERE milestone_90_at IS NOT NULL)
                 FROM forecast_research_events
                 GROUP BY 1
-                ORDER BY
-                    CASE bucket
-                        WHEN '<5' THEN 1
-                        WHEN '5-10' THEN 2
-                        WHEN '10-20' THEN 3
-                        WHEN '20-30' THEN 4
-                        ELSE 5
-                    END
+                ORDER BY MIN(ABS(forecast_probability_change_points))
                 """
             )
             bucket_rows = cur.fetchall()
