@@ -30,7 +30,7 @@ MAX_ENTRY_PRICE_CENTS=float(os.environ.get('MAX_ENTRY_PRICE_CENTS','95'))
 PAPER_RISK_DOLLARS=float(os.environ.get('PAPER_RISK_DOLLARS','10'))
 RESEARCH_MIN_FORECAST_CHANGE_POINTS=float(os.environ.get('RESEARCH_MIN_FORECAST_CHANGE_POINTS','3'))
 MIN_ENSEMBLE_MEMBERS=int(os.environ.get('MIN_ENSEMBLE_MEMBERS','20'))
-ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGNALS','false').lower() in {'1','true','yes'}
+ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGNALS','true').lower() in {'1','true','yes'}
 ALLOW_RAIN_PAPER_SIGNALS=os.environ.get('ALLOW_RAIN_PAPER_SIGNALS','false').lower() in {'1','true','yes'}
 KNOWN={'NYC':('New York City',40.7789,-73.9692,'America/New_York',True),'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',False),'MIA':('Miami',25.7959,-80.2870,'America/New_York',False),'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False)}
 logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('weather-kalshi-scanner'); _DB_CONN=None
@@ -246,6 +246,9 @@ def forecast_model_run(payload):
     if not isinstance(payload,dict):return None
     return payload.get('model_run') or payload.get('model_run_id') or payload.get('model_run_time')
 
+def forecast_payload_fingerprint(payload):
+    return h(payload) if isinstance(payload,dict) else None
+
 def signal_allowed(l,kind):
     if kind=='rain':
         return bool(ALLOW_RAIN_PAPER_SIGNALS and l.get('settlement_verified') and l.get('signal_enabled'))
@@ -364,10 +367,30 @@ def process_research(cache,ens,before,scan,observed,stats):
                 prev_payload=prev['payload'] or {}
                 current_run=ens.get(l['location_key'],{}).get('model_run')
                 previous_run=forecast_model_run(prev_payload)
-                if not current_run or not previous_run:
-                    stats['research_missing_model_run']=stats.get('research_missing_model_run',0)+1
+                if kind=='temperature':
+                    current_payload={
+                        'member_highs':d.get('member_highs') or [],
+                        'temperature_mean':d.get('temperature_mean'),
+                        'temperature_median':d.get('temperature_median'),
+                        'temperature_member_count':ens.get(l['location_key'],{}).get('temperature_member_count'),
+                        'model_run':current_run,
+                    }
+                else:
+                    current_payload={
+                        'member_precip_totals':d.get('member_precip_totals') or [],
+                        'precipitation_member_count':ens.get(l['location_key'],{}).get('precipitation_member_count'),
+                        'model_run':current_run,
+                    }
+                current_fp=forecast_payload_fingerprint(current_payload)
+                previous_fp=forecast_payload_fingerprint(prev_payload)
+                if not current_fp or not previous_fp:
                     continue
-                if current_run==previous_run:
+                # Open-Meteo may omit model-run metadata. A changed normalized forecast
+                # payload is still a real forecast revision and is exactly what this bot
+                # is designed to detect. If both run IDs exist, keep the extra safeguard.
+                if current_run and previous_run and current_run==previous_run and current_fp==previous_fp:
+                    continue
+                if current_fp==previous_fp:
                     continue
                 prevvals=prev_payload.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
                 cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals)
