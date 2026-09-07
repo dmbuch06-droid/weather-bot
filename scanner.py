@@ -1,6 +1,7 @@
-import hashlib, json, logging, math, os, re, statistics, time
+import hashlib, json, logging, os, re, statistics, time
 from collections import defaultdict
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import requests
 try:
@@ -28,6 +29,7 @@ MIN_ENTRY_PRICE_CENTS=float(os.environ.get('MIN_ENTRY_PRICE_CENTS','5'))
 MAX_ENTRY_PRICE_CENTS=float(os.environ.get('MAX_ENTRY_PRICE_CENTS','95'))
 PAPER_RISK_DOLLARS=float(os.environ.get('PAPER_RISK_DOLLARS','10'))
 RESEARCH_MIN_FORECAST_CHANGE_POINTS=float(os.environ.get('RESEARCH_MIN_FORECAST_CHANGE_POINTS','3'))
+MIN_ENSEMBLE_MEMBERS=int(os.environ.get('MIN_ENSEMBLE_MEMBERS','20'))
 ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGNALS','false').lower() in {'1','true','yes'}
 ALLOW_RAIN_PAPER_SIGNALS=os.environ.get('ALLOW_RAIN_PAPER_SIGNALS','false').lower() in {'1','true','yes'}
 KNOWN={'NYC':('New York City',40.7789,-73.9692,'America/New_York',True),'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',False),'MIA':('Miami',25.7959,-80.2870,'America/New_York',False),'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False)}
@@ -41,7 +43,11 @@ def h(x): return hashlib.sha256(json.dumps(x,sort_keys=True,separators=(',',':')
 def slug(s): return re.sub(r'[^A-Z0-9]+','_',s.upper()).strip('_')[:48] or 'UNKNOWN'
 def local_date(ts,tz): return datetime.fromisoformat(str(ts).replace('Z','+00:00')).astimezone(ZoneInfo(tz)).date().isoformat()
 def round_temp(v):
-    v=f(v); return None if v is None else int(math.floor(v+0.5))
+    v=f(v)
+    if v is None:return None
+    # Settlement values are whole degrees. Use decimal half-up so negative
+    # temperatures do not get Python's float/floor edge-case behavior.
+    return int(Decimal(str(v)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
 
 def db():
     if not DATABASE_URL: raise RuntimeError('DATABASE_URL is not configured')
@@ -161,7 +167,7 @@ def loc_for(s):
     if not feature.startswith('PPL'):
         log.warning('Skipping non-populated-place geocode for %s: %s (%s)', city, g.get('name'), feature)
         return None
-    k=slug(g.get('name') or city)
+    k=slug('_'.join(x for x in [g.get('name'),g.get('admin1'),g.get('country_code')] if x))
     q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),Json(g)))
     return getloc(k)
 def rowloc(r):
@@ -209,13 +215,13 @@ def date_market(m):
 
 def cache(entries): return [(s,l,markets(s.get('ticker'))) for s,l in entries]
 
-def snapshot(cache,scan_id,phase,stats):
+def snapshot(cache,scan_id,phase,stats,count_markets=False):
     for kind,entries in [('temperature',cache['temperature']),('precipitation',cache['rain'])]:
         for s,l,ms in entries:
             for m in ms:
                 yb=f(m.get('yes_bid_dollars'));ya=f(m.get('yes_ask_dollars'));nb=f(m.get('no_bid_dollars'));na=f(m.get('no_ask_dollars'))
                 q('''INSERT INTO market_snapshots(observed_at,ticker,event_ticker,series_ticker,market_date,city,market_kind,strike_type,floor_strike,cap_strike,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents,status,result,spread_yes_cents,spread_no_cents,volume,open_interest,scan_id,snapshot_phase,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',(m.get('ticker',''),m.get('event_ticker'),m.get('series_ticker'),date_market(m),l['city_name'],kind,m.get('strike_type'),f(m.get('floor_strike')),f(m.get('cap_strike')),None if yb is None else yb*100,None if ya is None else ya*100,None if nb is None else nb*100,None if na is None else na*100,None if f(m.get('last_price_dollars')) is None else f(m.get('last_price_dollars'))*100,m.get('status'),m.get('result'),None if yb is None or ya is None else max(0,ya*100-yb*100),None if nb is None or na is None else max(0,na*100-nb*100),f(m.get('volume')),f(m.get('open_interest')),scan_id,phase,MEASUREMENT_VERSION))
-                stats['temperature_markets' if kind=='temperature' else 'rain_markets']+=1
+                if count_markets:stats['temperature_markets' if kind=='temperature' else 'rain_markets']+=1
 
 def prior_market(ticker,before):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,before,MEASUREMENT_VERSION),one=True)
 def event_market(ticker,scan):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND scan_id=%s AND snapshot_phase=\'forecast_event\' AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,scan,MEASUREMENT_VERSION),one=True)
@@ -233,7 +239,20 @@ def rprob(vals):
     vals=[f(v) for v in vals if f(v) is not None];return None if not vals else 100*sum(v>0 for v in vals)/len(vals)
 
 def forecast_prev(city,var,date,before):
-    r=q('SELECT payload FROM forecast_observations WHERE city=%s AND variable=%s AND model=%s AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC LIMIT 1',(city,var,ENSEMBLE_MODEL,date,before,MEASUREMENT_VERSION),one=True);return r[0] if r else None
+    r=q('SELECT payload,observed_at FROM forecast_observations WHERE city=%s AND variable=%s AND model=%s AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(city,var,ENSEMBLE_MODEL,date,before,MEASUREMENT_VERSION),one=True)
+    return {'payload':r[0],'observed_at':r[1]} if r else None
+
+def forecast_model_run(payload):
+    if not isinstance(payload,dict):return None
+    return payload.get('model_run') or payload.get('model_run_id') or payload.get('model_run_time')
+
+def signal_allowed(l,kind):
+    if kind=='rain':
+        return bool(ALLOW_RAIN_PAPER_SIGNALS and l.get('settlement_verified') and l.get('signal_enabled'))
+    if ALLOW_UNVERIFIED_LOCATION_SIGNALS:
+        return True
+    return bool(l.get('settlement_verified') and l.get('signal_enabled'))
+
 def save_forecasts(det,ens,observed):
     for k,d in det.items():
         l=getloc(k);city=l['city_name']
@@ -282,12 +301,18 @@ def hourly(loc,d):
         if i<len(rain) and f(rain[i]) is not None:g[day]['p'].append(f(rain[i]))
     return {day:{'high':max(v['t']),'precipitation_sum':sum(v['p'])} for day,v in g.items() if v['t']}
 def fetch_det(locs):
-    p={'latitude':','.join(str(x['latitude']) for x in locs),'longitude':','.join(str(x['longitude']) for x in locs),'models':DETERMINISTIC_MODEL,'hourly':'temperature_2m,precipitation','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':'UTC','forecast_days':FORECAST_DAYS};d=http('https://api.open-meteo.com/v1/gfs',p);return {l['location_key']:{'daily':hourly(l,x),'model_run':x.get('model_run') or x.get('model_run_id') or x.get('model_run_time')} for l,x in norm(d,locs)}
+    p={'latitude':','.join(str(x['latitude']) for x in locs),'longitude':','.join(str(x['longitude']) for x in locs),'models':DETERMINISTIC_MODEL,'hourly':'temperature_2m,precipitation','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':'UTC','forecast_days':FORECAST_DAYS}
+    d=http('https://api.open-meteo.com/v1/gfs',p);out={}
+    for l,x in norm(d,locs):
+        daily=hourly(l,x)
+        if not daily:raise RuntimeError(f'No deterministic daily temperature data for {l["city_name"]}')
+        out[l['location_key']]={'daily':daily,'model_run':x.get('model_run') or x.get('model_run_id') or x.get('model_run_time')}
+    return out
 def fetch_ens(locs):
     p={'latitude':','.join(str(x['latitude']) for x in locs),'longitude':','.join(str(x['longitude']) for x in locs),'models':ENSEMBLE_MODEL,'hourly':'temperature_2m,precipitation','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':'UTC','forecast_days':FORECAST_DAYS};data=http('https://ensemble-api.open-meteo.com/v1/ensemble',p);out={}
     for l,d in norm(data,locs):
         x=d.get('hourly') or {};ts=x.get('time') or [];tk=sorted(k for k in x if k.startswith('temperature_2m_member'));pk=sorted(k for k in x if k.startswith('precipitation_member'));days=defaultdict(lambda:{'t':defaultdict(list),'p':defaultdict(float)})
-        if not tk:raise RuntimeError(f'No ensemble temperature members for {l["city_name"]}')
+        if len(tk)<MIN_ENSEMBLE_MEMBERS:raise RuntimeError(f'Only {len(tk)} ensemble temperature members for {l["city_name"]}; expected at least {MIN_ENSEMBLE_MEMBERS}')
         for i,t in enumerate(ts):
             day=local_date(t,l['timezone'])
             for k in tk:
@@ -301,16 +326,26 @@ def fetch_ens(locs):
             highs=[max(a) for a in v['t'].values() if a];rain=list(v['p'].values())
             if highs:daily[day]={'member_highs':highs,'member_precip_totals':rain,'temperature_mean':statistics.mean(highs),'temperature_median':statistics.median(highs)}
         out[l['location_key']]={'daily':daily,'temperature_member_count':len(tk),'precipitation_member_count':len(pk),'model_run':d.get('model_run') or d.get('model_run_id') or d.get('model_run_time')}
+    missing=[l['city_name'] for l in locs if l['location_key'] not in out or not out[l['location_key']]['daily']]
+    if missing:raise RuntimeError('Ensemble missing daily temperature data for: '+', '.join(missing))
     return out
 
 def create_research(l,date,var,m,prevp,curp,preask,eventask,scan,observed,stats):
     ch=curp-prevp
     if abs(ch)<RESEARCH_MIN_FORECAST_CHANGE_POINTS:return
-    side='YES' if ch>=0 else 'NO';prev_side=prevp if side=='YES' else 100-prevp;cur_side=curp if side=='YES' else 100-curp;side_ch=ch if side=='YES' else -ch;market_ch=eventask-preask;lag=side_ch-market_ch;edge=cur_side-eventask;fp=h({'city':l['city_name'],'date':date,'var':var,'ticker':m.get('ticker'),'forecast':curp,'previous':prevp})[:32]
-    r=q('''INSERT INTO forecast_research_events(event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,previous_probability,current_probability,forecast_probability_change_points,pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,initial_market_lag_points,initial_preliminary_edge_points,status,scan_id,forecast_observed_at,measurement_version,settlement_verified,location_key) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(event_fingerprint) DO NOTHING RETURNING id''',(fp,l['city_name'],date,var,m.get('ticker',''),side,prev_side,cur_side,side_ch,preask,eventask,market_ch,lag,edge,'open' if lag>0 else 'no_initial_lag',scan,observed,MEASUREMENT_VERSION,l['settlement_verified'],l['location_key']),one=True)
+    side='YES' if ch>=0 else 'NO'
+    prev_side=prevp if side=='YES' else 100-prevp
+    cur_side=curp if side=='YES' else 100-curp
+    side_ch=abs(ch)
+    market_ch=eventask-preask
+    lag=side_ch-market_ch
+    edge=cur_side-eventask
+    fp=h({'city':l['city_name'],'date':date,'var':var,'ticker':m.get('ticker'),'side':side,'previous':round(prevp,6),'current':round(curp,6)})[:32]
+    r=q("""INSERT INTO forecast_research_events(event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,previous_probability,current_probability,forecast_probability_change_points,pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,initial_market_lag_points,initial_preliminary_edge_points,status,scan_id,forecast_observed_at,measurement_version,settlement_verified,location_key) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(event_fingerprint) DO NOTHING RETURNING id""",(fp,l['city_name'],date,var,m.get('ticker',''),side,prev_side,cur_side,side_ch,preask,eventask,market_ch,lag,edge,'open' if lag>0 else 'no_initial_lag',scan,observed,MEASUREMENT_VERSION,l['settlement_verified'],l['location_key']),one=True)
     if r:stats['research_events_created']+=1
 
 def process_research(cache,ens,before,scan,observed,stats):
+    missing_prev_keys=set()
     for kind,keyvar,probfun in [('temperature','ensemble_temperature_distribution',tprob),('rain','ensemble_rain_distribution',rprob)]:
         for s,l,ms in cache[kind]:
             for m in ms:
@@ -321,41 +356,82 @@ def process_research(cache,ens,before,scan,observed,stats):
                 if not d:continue
                 curvals=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
                 prev=forecast_prev(l['city_name'],keyvar,date,before)
-                if not prev:stats['research_missing_previous_forecast']+=1;continue
-                prevvals=prev.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
-                cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals);pp=probfun(prevvals,m) if kind=='temperature' else probfun(prevvals)
+                if not prev:
+                    mk=(l['location_key'],date,kind)
+                    if mk not in missing_prev_keys:
+                        missing_prev_keys.add(mk);stats['research_missing_previous_forecast']+=1
+                    continue
+                prev_payload=prev['payload'] or {}
+                current_run=ens.get(l['location_key'],{}).get('model_run')
+                previous_run=forecast_model_run(prev_payload)
+                if not current_run or not previous_run:
+                    stats['research_missing_model_run']=stats.get('research_missing_model_run',0)+1
+                    continue
+                if current_run==previous_run:
+                    continue
+                prevvals=prev_payload.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
+                cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals)
+                pp=probfun(prevvals,m) if kind=='temperature' else probfun(prevvals)
                 if cp is None or pp is None:continue
-                stats['research_current_forecasts']+=1;stats['research_previous_forecasts']+=1
-                pm=prior_market(m.get('ticker',''),before);em=event_market(m.get('ticker',''),scan)
-                if not pm or not em:stats['research_missing_previous_market']+=1;continue
-                pa=pm[2] if cp>=pp else pm[4];ea=em[2] if cp>=pp else em[4]
-                if pa is not None and ea is not None:create_research(l,date,'temperature' if kind=='temperature' else 'precipitation',m,pp,cp,pa,ea,scan,observed,stats)
+                stats['research_current_forecasts']+=1
+                stats['research_previous_forecasts']+=1
+                pm=prior_market(m.get('ticker',''),before)
+                em=event_market(m.get('ticker',''),scan)
+                if not pm or not em:
+                    stats['research_missing_previous_market']+=1
+                    continue
+                side='YES' if cp>=pp else 'NO'
+                pa=pm[2] if side=='YES' else pm[4]
+                ea=em[2] if side=='YES' else em[4]
+                if pa is not None and ea is not None:
+                    create_research(l,date,'temperature' if kind=='temperature' else 'precipitation',m,pp,cp,pa,ea,scan,observed,stats)
 
 def candidate(l,date,m,cp,pp,pm,em,kind='temperature'):
     if cp is None or pp is None or not pm or not em or abs(cp-pp)<MIN_FORECAST_PROBABILITY_CHANGE_POINTS:return None
-    best=None;ch=cp-pp
+    if not signal_allowed(l,'rain' if kind=='precipitation' else 'temperature'):return None
+    best=None
+    ch=cp-pp
     for side in ('YES','NO'):
-        ask=em[2] if side=='YES' else em[4];prev=pm[2] if side=='YES' else pm[4]
+        ask=em[2] if side=='YES' else em[4]
+        prev=pm[2] if side=='YES' else pm[4]
         if ask is None or prev is None or not MIN_ENTRY_PRICE_CENTS<=ask<=MAX_ENTRY_PRICE_CENTS:continue
-        sp=cp if side=='YES' else 100-cp;sch=ch if side=='YES' else -ch;mc=ask-prev;lag=sch-mc;edge=sp-ask
+        sp=cp if side=='YES' else 100-cp
+        sch=abs(ch)
+        mc=ask-prev
+        lag=sch-mc
+        edge=sp-ask
         if lag<MIN_MARKET_LAG_POINTS or edge<MIN_PRELIMINARY_EDGE_POINTS:continue
-        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None}
+        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp}
         if best is None or (z['market_lag_points'],z['preliminary_edge_points'])>(best['market_lag_points'],best['preliminary_edge_points']):best=z
     return best
 
 def paper(signal,reason,stats):
-    fp=h(signal)[:24]
-    if q('SELECT 1 FROM paper_trades WHERE signal_fingerprint=%s',(fp,),one=True):return
-    entry=signal['entry_price_cents']/100;contracts=max(1,int(PAPER_RISK_DOLLARS/entry));stake=contracts*entry
-    q('''INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') ON CONFLICT(signal_fingerprint) DO NOTHING''',(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,Json(reason)));stats['paper_trades_created']+=1
-    if not q('SELECT 1 FROM alert_log WHERE fingerprint=%s',(fp,),one=True):
-        market_ticker=signal['market_ticker']
-        market_url='https://kalshi.com/search?q='+requests.utils.quote(market_ticker,safe='')
-        msg=f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\nMarket: `{market_ticker}`\nSide: **{signal['side']}**\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\n\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Profitable up to: {signal['max_profitable_entry_cents']:.1f}¢ before fees**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ Research only; verify the individual Kalshi market rules and fees before real trading."
-        try:
-            r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/7.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
-            if r is not None and 200<=r.status_code<300:q('INSERT INTO alert_log(fingerprint,sent_at,payload) VALUES(%s,NOW(),%s) ON CONFLICT DO NOTHING',(fp,Json(signal)));stats['discord_alerts']+=1
-        except Exception as e:log.error('Discord relay failed: %s',e)
+    fp=h({'city':signal['city'],'forecast_date':signal['forecast_date'],'market_ticker':signal['market_ticker'],'side':signal['side'],'previous_probability':round(signal['forecast_previous_probability'],6),'current_probability':round(signal['forecast_current_probability'],6)})
+    existing=q('SELECT id FROM paper_trades WHERE signal_fingerprint=%s',(fp,),one=True)
+    if not existing:
+        entry=signal['entry_price_cents']/100
+        if entry<=0:return
+        contracts=max(1,int(PAPER_RISK_DOLLARS/entry))
+        stake=contracts*entry
+        inserted=q("""INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') ON CONFLICT(signal_fingerprint) DO NOTHING RETURNING id""",(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,Json(reason)),one=True)
+        if not inserted:
+            existing=True
+        else:
+            stats['paper_trades_created']+=1
+    if q('SELECT 1 FROM alert_log WHERE fingerprint=%s',(fp,),one=True):return
+    market_ticker=signal['market_ticker']
+    event_ticker=reason.get('event_ticker') if isinstance(reason,dict) else None
+    series_ticker=reason.get('series_ticker') if isinstance(reason,dict) else None
+    market_url=reason.get('market_url') if isinstance(reason,dict) else None
+    if not market_url:
+        market_url=(f"https://kalshi.com/markets/{series_ticker.lower()}/{event_ticker.lower()}" if series_ticker and event_ticker else 'https://kalshi.com/search?q='+requests.utils.quote(market_ticker,safe=''))
+    msg=f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\nMarket: `{market_ticker}`\nSide: **{signal['side']}**\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\n\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — fair value is before fees; verify the individual market rules and settlement source before any real trade."
+    try:
+        r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/7.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
+        if r is not None and 200<=r.status_code<300:
+            q('INSERT INTO alert_log(fingerprint,sent_at,payload) VALUES(%s,NOW(),%s) ON CONFLICT DO NOTHING',(fp,Json(signal)))
+            stats['discord_alerts']+=1
+    except Exception as e:log.error('Discord relay failed: %s',e)
 
 def settle(stats):
     for tid,ticker,side,stake,contracts in q("SELECT id,market_ticker,side,stake_dollars,contracts FROM paper_trades WHERE status='open' LIMIT 200",fetch=True) or []:
@@ -383,15 +459,15 @@ def observe(stats,before):
         r=q("SELECT observed_at,CASE WHEN %s='YES' THEN yes_ask_cents ELSE no_ask_cents END FROM market_snapshots WHERE ticker=%s AND snapshot_phase='scan_start' AND measurement_version=%s AND observed_at>%s AND observed_at<%s ORDER BY observed_at LIMIT 1",(side,ticker,MEASUREMENT_VERSION,last or created,before),one=True)
         if not r or r[1] is None:continue
         move=r[1]-event;frac=move/lag if lag and lag>0 else 0;remaining=lag-move if lag is not None else None
-        q('''UPDATE forecast_research_events SET latest_observation_at=%s,latest_ask_cents=%s,latest_market_move_points=%s,latest_lag_remaining_points=%s,max_market_move_points=%s,first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END WHERE id=%s''',(r[0],r[1],move,remaining,max(maxmove or 0,move),move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],eid));q('INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction) VALUES(%s,%s,%s,%s,%s,%s)',(eid,r[0],r[1],move,remaining,frac));stats['research_events_observed']+=1
+        q('''UPDATE forecast_research_events SET latest_observation_at=%s,latest_ask_cents=%s,latest_market_move_points=%s,latest_lag_remaining_points=%s,max_market_move_points=%s,first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END WHERE id=%s''',(r[0],r[1],move,remaining,max(maxmove or 0,move),move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],eid));q('INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction) VALUES(%s,%s,%s,%s,%s,%s)',(eid,r[0],r[1],move,remaining,frac));stats['research_events_observed']+=1
 
 def run_scan():
-    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_events_settled':0,'nws_updates_detected':0}
+    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0}
     started=now();
     try:
         schema();scan=q("INSERT INTO scan_runs(started_at,status,stats,schema_version) VALUES(NOW(),'running','{}'::jsonb,%s) RETURNING id",(SCHEMA_VERSION,),one=True)[0];settle(stats)
-        xs=series_list();save_series(xs);te,re=discover(xs);stats['temperature_series']=len(te);stats['rain_series']=len(re);stats['weather_locations_discovered']=q('SELECT COUNT(*) FROM weather_locations',one=True)[0]
-        c={'temperature':cache(te),'rain':cache(re)};snapshot(c,scan,'scan_start',stats)
+        xs=series_list();save_series(xs);te,re=discover(xs);stats['temperature_series']=len(te);stats['rain_series']=len(re);stats['weather_locations_discovered']=len({l['location_key'] for _,l in te+re})
+        c={'temperature':cache(te),'rain':cache(re)};snapshot(c,scan,'scan_start',stats,count_markets=True)
         locs={l['location_key']:l for _,l in te+re};us,ch=nws_updates(list(locs.values()));stats['nws_updates_detected']=len(ch)
         if ch:
             stats['weather_refreshed']=False
@@ -404,8 +480,12 @@ def run_scan():
             observed=now()
             if ens:
                 stats['weather_refreshed']=True
-                snapshot(c,scan,'forecast_event',stats)
-                process_research(c,ens,started,scan,observed,stats)
+                # Re-fetch market data after the weather refresh. The event snapshot
+                # must represent the market at/after the forecast change, not a
+                # second copy of the scan-start snapshot.
+                event_cache={'temperature':cache(te),'rain':cache(re)}
+                snapshot(event_cache,scan,'forecast_event',stats,count_markets=False)
+                process_research(event_cache,ens,started,scan,observed,stats)
             for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
                 if not ens:
                     break
@@ -418,8 +498,11 @@ def run_scan():
                         if not d:continue
                         cur=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];prev=forecast_prev(l['city_name'],'ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution',date,started)
                         if not prev:continue
-                        old=prev.get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];cp=tprob(cur,m) if kind=='temperature' else rprob(cur);pp=tprob(old,m) if kind=='temperature' else rprob(old);pm=prior_market(m.get('ticker',''),started);em=event_market(m.get('ticker',''),scan);sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
-                        if sig:paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'ensemble_model':ENSEMBLE_MODEL},stats)
+                        old=prev['payload'].get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];cp=tprob(cur,m) if kind=='temperature' else rprob(cur);pp=tprob(old,m) if kind=='temperature' else rprob(old);pm=prior_market(m.get('ticker',''),started);em=event_market(m.get('ticker',''),scan);sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
+                        if sig:
+                            stats['forecast_shocks']+=1
+                            if kind=='rain':stats['rain_forecast_shocks']+=1
+                            paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url')},stats)
             if ens:
                 save_forecasts(det,ens,observed)
                 save_nws(us,locs)
