@@ -21,7 +21,7 @@ NWS_API_URL='https://api.weather.gov'
 NWS_USER_AGENT=os.environ.get('NWS_USER_AGENT','WeatherKalshiResearchBot/7.0')
 GEOCODING_API_URL='https://geocoding-api.open-meteo.com/v1/search'
 ENSEMBLE_MODEL='gfs_seamless'; DETERMINISTIC_MODEL='gfs_seamless'
-SCHEMA_VERSION=7; MEASUREMENT_VERSION='v7_clean_baseline'
+SCHEMA_VERSION=9; MEASUREMENT_VERSION='v9_market_audit_exact_contract'
 MIN_FORECAST_PROBABILITY_CHANGE_POINTS=float(os.environ.get('MIN_FORECAST_PROBABILITY_CHANGE_POINTS','20'))
 MIN_MARKET_LAG_POINTS=float(os.environ.get('MIN_MARKET_LAG_POINTS','10'))
 MIN_PRELIMINARY_EDGE_POINTS=float(os.environ.get('MIN_PRELIMINARY_EDGE_POINTS','10'))
@@ -91,7 +91,7 @@ def schema():
 '''CREATE TABLE IF NOT EXISTS paper_trades(id BIGSERIAL PRIMARY KEY,signal_fingerprint TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ NOT NULL,settled_at TIMESTAMPTZ,city TEXT NOT NULL,forecast_date DATE NOT NULL,market_ticker TEXT NOT NULL,market_kind TEXT NOT NULL,side TEXT NOT NULL,entry_price_cents DOUBLE PRECISION NOT NULL,stake_dollars DOUBLE PRECISION NOT NULL,contracts DOUBLE PRECISION NOT NULL,model_probability_proxy DOUBLE PRECISION NOT NULL,preliminary_edge_points DOUBLE PRECISION NOT NULL,forecast_probability_change_points DOUBLE PRECISION NOT NULL,market_price_change_points DOUBLE PRECISION NOT NULL,market_lag_points DOUBLE PRECISION NOT NULL,forecast_temperature_change_f DOUBLE PRECISION,reason JSONB NOT NULL,result TEXT,profit_loss_dollars DOUBLE PRECISION,status TEXT NOT NULL DEFAULT 'open')''',
 '''CREATE TABLE IF NOT EXISTS alert_log(fingerprint TEXT PRIMARY KEY,sent_at TIMESTAMPTZ NOT NULL,payload JSONB NOT NULL)''',
 '''CREATE TABLE IF NOT EXISTS forecast_research_events(id BIGSERIAL PRIMARY KEY,event_fingerprint TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ NOT NULL,city TEXT NOT NULL,forecast_date DATE NOT NULL,variable TEXT NOT NULL,market_ticker TEXT NOT NULL,side TEXT NOT NULL,previous_probability DOUBLE PRECISION NOT NULL,current_probability DOUBLE PRECISION NOT NULL,forecast_probability_change_points DOUBLE PRECISION NOT NULL,pre_forecast_ask_cents DOUBLE PRECISION,event_ask_cents DOUBLE PRECISION,initial_market_change_points DOUBLE PRECISION,initial_market_lag_points DOUBLE PRECISION,initial_preliminary_edge_points DOUBLE PRECISION,first_response_at TIMESTAMPTZ,milestone_25_at TIMESTAMPTZ,milestone_50_at TIMESTAMPTZ,milestone_75_at TIMESTAMPTZ,milestone_90_at TIMESTAMPTZ,latest_observation_at TIMESTAMPTZ,latest_ask_cents DOUBLE PRECISION,latest_market_move_points DOUBLE PRECISION,latest_lag_remaining_points DOUBLE PRECISION,max_market_move_points DOUBLE PRECISION DEFAULT 0,status TEXT NOT NULL DEFAULT 'open',closed_at TIMESTAMPTZ,settlement_result TEXT)''',
-'''CREATE TABLE IF NOT EXISTS forecast_research_updates(id BIGSERIAL PRIMARY KEY,event_id BIGINT NOT NULL REFERENCES forecast_research_events(id) ON DELETE CASCADE,observed_at TIMESTAMPTZ NOT NULL,market_ask_cents DOUBLE PRECISION,market_move_points DOUBLE PRECISION,lag_remaining_points DOUBLE PRECISION,market_response_fraction DOUBLE PRECISION)''',
+'''CREATE TABLE IF NOT EXISTS forecast_research_updates(id BIGSERIAL PRIMARY KEY,event_id BIGINT NOT NULL REFERENCES forecast_research_events(id) ON DELETE CASCADE,observed_at TIMESTAMPTZ NOT NULL,market_ask_cents DOUBLE PRECISION,market_move_points DOUBLE PRECISION,lag_remaining_points DOUBLE PRECISION,market_response_fraction DOUBLE PRECISION,scan_id BIGINT,ticker TEXT,event_ticker TEXT,series_ticker TEXT,yes_bid_cents DOUBLE PRECISION,yes_ask_cents DOUBLE PRECISION,no_bid_cents DOUBLE PRECISION,no_ask_cents DOUBLE PRECISION,last_price_cents DOUBLE PRECISION,spread_yes_cents DOUBLE PRECISION,spread_no_cents DOUBLE PRECISION,volume DOUBLE PRECISION,open_interest DOUBLE PRECISION)''',
 '''CREATE TABLE IF NOT EXISTS weather_locations(location_key TEXT PRIMARY KEY,city_name TEXT NOT NULL,latitude DOUBLE PRECISION NOT NULL,longitude DOUBLE PRECISION NOT NULL,timezone TEXT NOT NULL,settlement_verified BOOLEAN NOT NULL DEFAULT FALSE,signal_enabled BOOLEAN NOT NULL DEFAULT FALSE,mapping_method TEXT NOT NULL,nws_grid_url TEXT,source_series_tickers JSONB NOT NULL DEFAULT '[]'::jsonb,raw_geocode JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''']:
         q(s)
     for s in [
@@ -109,6 +109,20 @@ def schema():
         'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS settlement_verified BOOLEAN',
         'ALTER TABLE forecast_research_events ADD COLUMN IF NOT EXISTS location_key TEXT',
         'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS scan_id BIGINT',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS ticker TEXT',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS event_ticker TEXT',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS series_ticker TEXT',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS yes_bid_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS yes_ask_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS no_bid_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS no_ask_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS last_price_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS spread_yes_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS spread_no_cents DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS volume DOUBLE PRECISION',
+        'ALTER TABLE forecast_research_updates ADD COLUMN IF NOT EXISTS open_interest DOUBLE PRECISION',
+        'ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS measurement_version TEXT',
+        'ALTER TABLE alert_log ADD COLUMN IF NOT EXISTS measurement_version TEXT',
         'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS source_observed_at TIMESTAMPTZ',
         'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS measurement_version TEXT']:
         q(s)
@@ -224,7 +238,23 @@ def snapshot(cache,scan_id,phase,stats,count_markets=False):
                 if count_markets:stats['temperature_markets' if kind=='temperature' else 'rain_markets']+=1
 
 def prior_market(ticker,before):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,before,MEASUREMENT_VERSION),one=True)
-def event_market(ticker,scan):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND scan_id=%s AND snapshot_phase=\'forecast_event\' AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,scan,MEASUREMENT_VERSION),one=True)
+def event_market(ticker,scan):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents,spread_yes_cents,spread_no_cents,volume,open_interest,event_ticker,series_ticker FROM market_snapshots WHERE ticker=%s AND scan_id=%s AND snapshot_phase=\'forecast_event\' AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,scan,MEASUREMENT_VERSION),one=True)
+
+def contract_label(m):
+    st=(m.get('strike_type') or '').lower()
+    lo=f(m.get('floor_strike'));hi=f(m.get('cap_strike'))
+    if st=='between' and lo is not None and hi is not None:
+        # Kalshi weather bracket metadata uses the actual whole-degree endpoints.
+        low=int(Decimal(str(lo)).to_integral_value(rounding=ROUND_HALF_UP))
+        high=int(Decimal(str(hi)).to_integral_value(rounding=ROUND_HALF_UP))
+        return f'{low}°–{high}°'
+    if st=='greater' and lo is not None:
+        threshold=int(Decimal(str(lo)).to_integral_value(rounding=ROUND_HALF_UP))
+        return f'{threshold}° or higher'
+    if st=='less' and hi is not None:
+        threshold=int(Decimal(str(hi)).to_integral_value(rounding=ROUND_HALF_UP))-1
+        return f'{threshold}° or lower'
+    return 'Temperature contract (see ticker)'
 
 def tprob(vals,m):
     vals=[round_temp(v) for v in vals if round_temp(v) is not None];
@@ -424,7 +454,7 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature'):
         lag=sch-mc
         edge=sp-ask
         if lag<MIN_MARKET_LAG_POINTS or edge<MIN_PRELIMINARY_EDGE_POINTS:continue
-        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp}
+        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m)}
         if best is None or (z['market_lag_points'],z['preliminary_edge_points'])>(best['market_lag_points'],best['preliminary_edge_points']):best=z
     return best
 
@@ -434,25 +464,21 @@ def paper(signal,reason,stats):
     if not existing:
         entry=signal['entry_price_cents']/100
         if entry<=0:return
-        contracts=max(1,int(PAPER_RISK_DOLLARS/entry))
-        stake=contracts*entry
-        inserted=q("""INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') ON CONFLICT(signal_fingerprint) DO NOTHING RETURNING id""",(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,Json(reason)),one=True)
-        if not inserted:
-            existing=True
-        else:
-            stats['paper_trades_created']+=1
+        contracts=max(1,int(PAPER_RISK_DOLLARS/entry));stake=contracts*entry
+        inserted=q("""INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status,measurement_version) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s) ON CONFLICT(signal_fingerprint) DO NOTHING RETURNING id""",(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,Json(reason),MEASUREMENT_VERSION),one=True)
+        if not inserted: existing=True
+        else: stats['paper_trades_created']+=1
     if q('SELECT 1 FROM alert_log WHERE fingerprint=%s',(fp,),one=True):return
-    market_ticker=signal['market_ticker']
-    event_ticker=reason.get('event_ticker') if isinstance(reason,dict) else None
-    series_ticker=reason.get('series_ticker') if isinstance(reason,dict) else None
-    market_url=reason.get('market_url') if isinstance(reason,dict) else None
+    market_ticker=signal['market_ticker'];event_ticker=reason.get('event_ticker');series_ticker=reason.get('series_ticker');market_url=reason.get('market_url')
     if not market_url:
         market_url=(f"https://kalshi.com/markets/{series_ticker.lower()}/{event_ticker.lower()}" if series_ticker and event_ticker else 'https://kalshi.com/search?q='+requests.utils.quote(market_ticker,safe=''))
-    msg=f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\nMarket: `{market_ticker}`\nSide: **{signal['side']}**\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\n\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — fair value is before fees; verify the individual market rules and settlement source before any real trade."
+    observed_at=signal.get('market_observed_at');observed_text=observed_at.isoformat() if hasattr(observed_at,'isoformat') else str(observed_at or 'unknown')
+    def fmt(v): return f'{v:.1f}c' if v is not None else 'n/a'
+    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**CONTRACT: {signal.get('contract_label','Temperature contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — the quote above is the exact market snapshot used by the scanner. The ensemble value is an uncalibrated frequency proxy; verify active Kalshi market rules before any real trade.")
     try:
-        r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/7.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
+        r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/8.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
         if r is not None and 200<=r.status_code<300:
-            q('INSERT INTO alert_log(fingerprint,sent_at,payload) VALUES(%s,NOW(),%s) ON CONFLICT DO NOTHING',(fp,Json(signal)))
+            q('INSERT INTO alert_log(fingerprint,sent_at,payload,measurement_version) VALUES(%s,NOW(),%s,%s) ON CONFLICT DO NOTHING',(fp,Json({**signal,'alert_observed_at_utc':observed_text,'contract_label':signal.get('contract_label')}),MEASUREMENT_VERSION))
             stats['discord_alerts']+=1
     except Exception as e:log.error('Discord relay failed: %s',e)
 
@@ -479,10 +505,65 @@ def close_research_events(stats):
 def observe(stats,before):
     rows=q("SELECT id,market_ticker,side,created_at,event_ask_cents,initial_market_lag_points,latest_observation_at,max_market_move_points FROM forecast_research_events WHERE measurement_version=%s AND status='open' AND created_at<%s LIMIT 1000",(MEASUREMENT_VERSION,before),fetch=True) or []
     for eid,ticker,side,created,event,lag,last,maxmove in rows:
-        r=q("SELECT observed_at,CASE WHEN %s='YES' THEN yes_ask_cents ELSE no_ask_cents END FROM market_snapshots WHERE ticker=%s AND snapshot_phase='scan_start' AND measurement_version=%s AND observed_at>%s AND observed_at<%s ORDER BY observed_at LIMIT 1",(side,ticker,MEASUREMENT_VERSION,last or created,before),one=True)
-        if not r or r[1] is None:continue
-        move=r[1]-event;frac=move/lag if lag and lag>0 else 0;remaining=lag-move if lag is not None else None
-        q('''UPDATE forecast_research_events SET latest_observation_at=%s,latest_ask_cents=%s,latest_market_move_points=%s,latest_lag_remaining_points=%s,max_market_move_points=%s,first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END WHERE id=%s''',(r[0],r[1],move,remaining,max(maxmove or 0,move),move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],move,move,r[0],eid));q('INSERT INTO forecast_research_updates(event_id,observed_at,market_ask_cents,market_move_points,lag_remaining_points,market_response_fraction) VALUES(%s,%s,%s,%s,%s,%s)',(eid,r[0],r[1],move,remaining,frac));stats['research_events_observed']+=1
+        r=q("""
+            SELECT observed_at,scan_id,ticker,event_ticker,series_ticker,
+                   yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,
+                   last_price_cents,spread_yes_cents,spread_no_cents,volume,open_interest
+            FROM market_snapshots
+            WHERE ticker=%s AND snapshot_phase='scan_start'
+              AND measurement_version=%s AND observed_at>%s AND observed_at<%s
+            ORDER BY observed_at,id
+            LIMIT 1
+        """,(ticker,MEASUREMENT_VERSION,last or created,before),one=True)
+        if not r or r[1] is None:
+            continue
+        (observed_at,scan_id,ticker_value,event_ticker,series_ticker,
+         yes_bid,yes_ask,no_bid,no_ask,last_price,spread_yes,spread_no,volume,open_interest)=r
+        current_ask=yes_ask if side=='YES' else no_ask
+        if current_ask is None:
+            continue
+        move=current_ask-event
+        frac=move/lag if lag and lag>0 else 0
+        remaining=lag-move if lag is not None else None
+        max_move_new=max(maxmove or 0,move)
+        q("""
+            UPDATE forecast_research_events
+            SET latest_observation_at=%s,
+                latest_ask_cents=%s,
+                latest_market_move_points=%s,
+                latest_lag_remaining_points=%s,
+                max_market_move_points=%s,
+                first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,
+                milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,
+                milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,
+                milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,
+                milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END
+            WHERE id=%s
+        """,(observed_at,current_ask,move,remaining,max_move_new,
+             move,observed_at,
+             move,move,observed_at,
+             move,move,observed_at,
+             move,move,observed_at,
+             move,move,observed_at,eid))
+        q("""
+            INSERT INTO forecast_research_updates(
+                event_id,observed_at,market_ask_cents,market_move_points,
+                lag_remaining_points,market_response_fraction,scan_id,ticker,
+                event_ticker,series_ticker,yes_bid_cents,yes_ask_cents,
+                no_bid_cents,no_ask_cents,last_price_cents,spread_yes_cents,
+                spread_no_cents,volume,open_interest
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,(eid,observed_at,current_ask,move,remaining,frac,scan_id,ticker_value,
+              event_ticker,series_ticker,yes_bid,yes_ask,no_bid,no_ask,last_price,
+              spread_yes,spread_no,volume,open_interest))
+        stats['research_events_observed']+=1
+        log.info(
+            'RESEARCH MARKET | %s | side=%s | observed=%s | scan=%s | YES %.1f/%.1f | NO %.1f/%.1f | last=%s | volume=%s',
+            ticker_value,side,observed_at.isoformat(),scan_id,
+            yes_bid if yes_bid is not None else float('nan'),yes_ask if yes_ask is not None else float('nan'),
+            no_bid if no_bid is not None else float('nan'),no_ask if no_ask is not None else float('nan'),
+            f'{last_price:.1f}c' if last_price is not None else 'n/a',
+            f'{volume:.0f}' if volume is not None else 'n/a')
 
 def run_scan():
     scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0}
@@ -525,7 +606,7 @@ def run_scan():
                         if sig:
                             stats['forecast_shocks']+=1
                             if kind=='rain':stats['rain_forecast_shocks']+=1
-                            paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url')},stats)
+                            paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url'),'market_observed_at':sig.get('market_observed_at'),'yes_bid_cents':sig.get('yes_bid_cents'),'yes_ask_cents':sig.get('yes_ask_cents'),'no_bid_cents':sig.get('no_bid_cents'),'no_ask_cents':sig.get('no_ask_cents'),'last_price_cents':sig.get('last_price_cents'),'spread_yes_cents':sig.get('spread_yes_cents'),'spread_no_cents':sig.get('spread_no_cents'),'volume':sig.get('volume'),'open_interest':sig.get('open_interest')},stats)
             if ens:
                 save_forecasts(det,ens,observed)
                 save_nws(us,locs)
