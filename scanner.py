@@ -337,7 +337,7 @@ def save_forecasts(det,ens,observed):
             if x['member_precip_totals']:
                 p={'member_precip_totals':x['member_precip_totals'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
                 rain_fp=forecast_revision_fingerprint('ensemble_rain_distribution',p)
-                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload, payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
+                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
 
 def nws_updates(locations):
     out={};changed={}
