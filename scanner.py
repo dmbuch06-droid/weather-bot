@@ -35,6 +35,7 @@ RESEARCH_MIN_FORECAST_CHANGE_POINTS=float(os.environ.get('RESEARCH_MIN_FORECAST_
 MIN_ENSEMBLE_MEMBERS=int(os.environ.get('MIN_ENSEMBLE_MEMBERS','20'))
 ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGNALS','true').lower() in {'1','true','yes'}
 ALLOW_RAIN_PAPER_SIGNALS=os.environ.get('ALLOW_RAIN_PAPER_SIGNALS','false').lower() in {'1','true','yes'}
+REQUIRE_NWS_CONFIRMATION=os.environ.get('REQUIRE_NWS_CONFIRMATION','true').lower() in {'1','true','yes'}
 KNOWN={'NYC':('New York City',40.7789,-73.9692,'America/New_York',True),'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',False),'MIA':('Miami',25.7959,-80.2870,'America/New_York',False),'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False)}
 logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('weather-kalshi-scanner'); _DB_CONN=None
 
