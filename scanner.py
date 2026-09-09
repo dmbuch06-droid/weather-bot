@@ -61,7 +61,13 @@ def q(sql,p=(),fetch=False,one=False):
     try:
         with _DB_CONN.cursor() as c:
             c.execute(sql,p); r=c.fetchone() if one else (c.fetchall() if fetch else None)
-        _DB_CONN.commit(); return r
+        # Read-only SELECTs do not need a commit. Avoiding a commit on every
+        # lookup is important because discovery/research performs many small
+        # reads per scan. Writes/DDL still commit immediately, preserving the
+        # existing error/transaction behavior.
+        if not sql.lstrip().upper().startswith('SELECT'):
+            _DB_CONN.commit()
+        return r
     except Exception:
         _DB_CONN.rollback(); raise
 def close_db():
@@ -317,13 +323,50 @@ def date_market(m):
 def cache(entries): return [(s,l,markets(s.get('ticker'))) for s,l in entries]
 
 def snapshot(cache,scan_id,phase,stats,count_markets=False):
-    for kind,entries in [('temperature',cache['temperature']),('precipitation',cache['rain'])]:
+    # Batch market snapshot inserts. Committing once per phase is much faster
+    # than issuing one INSERT+COMMIT for every market.
+    rows=[]
+    counts={'temperature':0,'rain':0}
+    for kind,entries in [('temperature',cache['temperature']),('rain',cache['rain'])]:
         for s,l,ms in entries:
             for m in ms:
                 yb=f(m.get('yes_bid_dollars'));ya=f(m.get('yes_ask_dollars'));nb=f(m.get('no_bid_dollars'));na=f(m.get('no_ask_dollars'))
-                q('''INSERT INTO market_snapshots(observed_at,ticker,event_ticker,series_ticker,market_date,city,market_kind,strike_type,floor_strike,cap_strike,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents,status,result,spread_yes_cents,spread_no_cents,volume,open_interest,scan_id,snapshot_phase,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',(m.get('ticker',''),m.get('event_ticker'),m.get('series_ticker'),date_market(m),l['city_name'],kind,m.get('strike_type'),f(m.get('floor_strike')),f(m.get('cap_strike')),None if yb is None else yb*100,None if ya is None else ya*100,None if nb is None else nb*100,None if na is None else na*100,None if f(m.get('last_price_dollars')) is None else f(m.get('last_price_dollars'))*100,m.get('status'),m.get('result'),None if yb is None or ya is None else max(0,ya*100-yb*100),None if nb is None or na is None else max(0,na*100-nb*100),f(m.get('volume')),f(m.get('open_interest')),scan_id,phase,MEASUREMENT_VERSION))
-                if count_markets:stats['temperature_markets' if kind=='temperature' else 'rain_markets']+=1
-
+                rows.append((
+                    m.get('ticker',''),m.get('event_ticker'),m.get('series_ticker'),
+                    date_market(m),l['city_name'],kind,m.get('strike_type'),
+                    f(m.get('floor_strike')),f(m.get('cap_strike')),
+                    None if yb is None else yb*100,None if ya is None else ya*100,
+                    None if nb is None else nb*100,None if na is None else na*100,
+                    None if f(m.get('last_price_dollars')) is None else f(m.get('last_price_dollars'))*100,
+                    m.get('status'),m.get('result'),
+                    None if yb is None or ya is None else max(0,ya*100-yb*100),
+                    None if nb is None or na is None else max(0,na*100-nb*100),
+                    f(m.get('volume')),f(m.get('open_interest')),
+                    scan_id,phase,MEASUREMENT_VERSION))
+                counts[kind]+=1
+    if rows:
+        c=db()
+        try:
+            with c.cursor() as cur:
+                cur.executemany(
+                    '''INSERT INTO market_snapshots(
+                        observed_at,ticker,event_ticker,series_ticker,market_date,city,
+                        market_kind,strike_type,floor_strike,cap_strike,
+                        yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,
+                        last_price_cents,status,result,spread_yes_cents,spread_no_cents,
+                        volume,open_interest,scan_id,snapshot_phase,measurement_version
+                    ) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                             %s,%s,%s,%s,%s,%s,%s,%s)
+                    ''',rows)
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
+    if count_markets:
+        stats['temperature_markets']+=counts['temperature']
+        stats['rain_markets']+=counts['rain']
 def prior_market(ticker,before):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents FROM market_snapshots WHERE ticker=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,before,MEASUREMENT_VERSION),one=True)
 def event_market(ticker,scan):return q('SELECT observed_at,yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,last_price_cents,spread_yes_cents,spread_no_cents,volume,open_interest,event_ticker,series_ticker FROM market_snapshots WHERE ticker=%s AND scan_id=%s AND snapshot_phase=\'forecast_event\' AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(ticker,scan,MEASUREMENT_VERSION),one=True)
 
@@ -438,9 +481,26 @@ def nws_grid_snapshot(locations):
         except Exception as e:log.warning('NWS grid unavailable for %s: %s',l['city_name'],e)
     return update_times,changed,grid_values
 def save_nws(us,locs):
+    rows=[]
     for k,u in us.items():
         l=locs.get(k)
-        if l:q('''INSERT INTO weather_service_state(city_code,source,last_update_at,checked_at) VALUES(%s,'nws',%s,NOW()) ON CONFLICT(city_code) DO UPDATE SET source='nws',last_update_at=EXCLUDED.last_update_at,checked_at=NOW()''',(k,u))
+        if l:rows.append((k,u))
+    if not rows:return
+    c=db()
+    try:
+        with c.cursor() as cur:
+            cur.executemany(
+                '''INSERT INTO weather_service_state(city_code,source,last_update_at,checked_at)
+                   VALUES(%s,'nws',%s,NOW())
+                   ON CONFLICT(city_code) DO UPDATE SET
+                       source='nws',last_update_at=EXCLUDED.last_update_at,checked_at=NOW()''',
+                rows)
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 def norm(data,locs):
     rows=data if isinstance(data,list) else [data]
@@ -524,22 +584,39 @@ def expand_grid_series(values,tz,unit_is_celsius,agg='max'):
     return out
 
 def save_nws_grid_values(nws_grid,observed,stats):
-    saved=0
+    # Batch all NWS grid observations into one transaction. The old version
+    # called q() once per value, which committed every row and made this phase
+    # take ~110 seconds on a large dynamically discovered city set.
+    rows=[]
     for k,d in nws_grid.items():
         l=getloc(k)
         if not l:continue
         city=l['city_name']
         for date,high_f in (d.get('daily_high_f') or {}).items():
             payload={'value':high_f,'update_time':d.get('update_time'),'location_key':k}
-            fp=h(payload)
-            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'nws_temperature_high\',\'nws_grid\',%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,date,high_f,J(payload),fp,observed,MEASUREMENT_VERSION))
-            saved+=1
+            rows.append((city,'nws_temperature_high','nws_grid',date,high_f,J(payload),h(payload),observed,MEASUREMENT_VERSION))
         for date,pop in (d.get('daily_pop_max') or {}).items():
             payload={'value':pop,'update_time':d.get('update_time'),'location_key':k}
-            fp=h(payload)
-            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'nws_precip_probability_max\',\'nws_grid\',%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,date,pop,J(payload),fp,observed,MEASUREMENT_VERSION))
-            saved+=1
-    stats['nws_grid_values_saved']=stats.get('nws_grid_values_saved',0)+saved
+            rows.append((city,'nws_precip_probability_max','nws_grid',date,pop,J(payload),h(payload),observed,MEASUREMENT_VERSION))
+    if rows:
+        c=db()
+        try:
+            with c.cursor() as cur:
+                cur.executemany(
+                    '''INSERT INTO forecast_observations(
+                        observed_at,city,variable,model,forecast_date,scalar_value,
+                        payload,payload_hash,source_observed_at,measurement_version
+                    ) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(city,variable,model,forecast_date,payload_hash)
+                    DO NOTHING''',
+                    rows)
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
+    stats['nws_grid_values_saved']=stats.get('nws_grid_values_saved',0)+len(rows)
 
 def nws_latest_high(city,date,before):
     r=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,before,MEASUREMENT_VERSION),one=True)
@@ -553,8 +630,8 @@ def nws_confirms_direction(location_key,date,gfs_change,before):
     l=getloc(location_key)
     if not l:return None
     city=l['city_name']
-    current=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date),one=True)
-    previous=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s AND observed_at<%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,before),one=True)
+    current=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,MEASUREMENT_VERSION),one=True)
+    previous=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,before,MEASUREMENT_VERSION),one=True)
     if not current or not previous or current[0] is None or previous[0] is None:
         return None
     nws_change=current[0]-previous[0]
@@ -577,7 +654,14 @@ def create_research(l,date,var,m,prevp,curp,preask,eventask,scan,observed,stats)
     if r:stats['research_events_created']+=1
 
 def process_research(cache,ens,before,scan,observed,stats):
+    # Cache repeated lookups. Each market in a city/date shares the same
+    # previous ensemble forecast; each ticker shares the same market snapshots.
+    # This avoids hundreds/thousands of redundant DB round trips on a scan.
     missing_prev_keys=set()
+    forecast_cache={}
+    prior_market_cache={}
+    event_market_cache={}
+
     for kind,keyvar,probfun in [('temperature','ensemble_temperature_distribution',tprob),('rain','ensemble_rain_distribution',rprob)]:
         for s,l,ms in cache[kind]:
             for m in ms:
@@ -587,12 +671,18 @@ def process_research(cache,ens,before,scan,observed,stats):
                 d=ens.get(l['location_key'],{}).get('daily',{}).get(date)
                 if not d:continue
                 curvals=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
-                prev=forecast_prev(l['city_name'],keyvar,date,before)
+
+                fkey=(l['city_name'],keyvar,date)
+                if fkey not in forecast_cache:
+                    forecast_cache[fkey]=forecast_prev(l['city_name'],keyvar,date,before)
+                prev=forecast_cache[fkey]
+
                 if not prev:
                     mk=(l['location_key'],date,kind)
                     if mk not in missing_prev_keys:
                         missing_prev_keys.add(mk);stats['research_missing_previous_forecast']+=1
                     continue
+
                 prev_payload=prev['payload'] or {}
                 current_run=ens.get(l['location_key'],{}).get('model_run')
                 if kind=='temperature':
@@ -601,21 +691,30 @@ def process_research(cache,ens,before,scan,observed,stats):
                 else:
                     current_payload={'member_precip_totals':d.get('member_precip_totals') or [],'model_run':current_run}
                     variable_key='ensemble_rain_distribution'
+
                 current_fp=forecast_revision_fingerprint(variable_key,current_payload)
                 previous_fp=forecast_revision_fingerprint(variable_key,prev_payload)
                 if not current_fp or not previous_fp or current_fp==previous_fp:
                     continue
+
                 prevvals=prev_payload.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
                 cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals)
                 pp=probfun(prevvals,m) if kind=='temperature' else probfun(prevvals)
                 if cp is None or pp is None:continue
                 stats['research_current_forecasts']+=1
                 stats['research_previous_forecasts']+=1
-                pm=prior_market(m.get('ticker',''),before)
-                em=event_market(m.get('ticker',''),scan)
+
+                ticker=m.get('ticker','')
+                if ticker not in prior_market_cache:
+                    prior_market_cache[ticker]=prior_market(ticker,before)
+                pm=prior_market_cache[ticker]
+                if ticker not in event_market_cache:
+                    event_market_cache[ticker]=event_market(ticker,scan)
+                em=event_market_cache[ticker]
                 if not pm or not em:
                     stats['research_missing_previous_market']+=1
                     continue
+
                 side='YES' if cp>=pp else 'NO'
                 pa=pm[2] if side=='YES' else pm[4]
                 ea=em[2] if side=='YES' else em[4]
@@ -825,30 +924,55 @@ def run_scan():
             process_research(event_cache,ens,started,scan,observed,stats)
             t=phase('process_research',t)
 
+            # Cache repeated DB lookups. Every market in the same city/date
+            # shares the previous forecast and NWS confirmation; every ticker
+            # shares the same market snapshots.
+            forecast_cache={}
+            prior_cache={}
+            event_cache_lookup={}
+            nws_confirmation_cache={}
+
             for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
                 if kind=='rain' and not ALLOW_RAIN_PAPER_SIGNALS:
                     continue
                 for s,l,ms in entries:
                     if not l['settlement_verified'] and not ALLOW_UNVERIFIED_LOCATION_SIGNALS:
                         continue
+                    variable_key='ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution'
                     for m in ms:
                         date=date_market(m)
                         d=ens.get(l['location_key'],{}).get('daily',{}).get(date or '')
                         if not d:
                             continue
                         cur=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
-                        variable_key='ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution'
-                        prev=forecast_prev(l['city_name'],variable_key,date,started)
+
+                        fkey=(l['city_name'],variable_key,date)
+                        if fkey not in forecast_cache:
+                            forecast_cache[fkey]=forecast_prev(l['city_name'],variable_key,date,started)
+                        prev=forecast_cache[fkey]
                         if not prev:
                             continue
+
                         old=prev['payload'].get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
                         cp=tprob(cur,m) if kind=='temperature' else rprob(cur)
                         pp=tprob(old,m) if kind=='temperature' else rprob(old)
-                        pm=prior_market(m.get('ticker',''),started)
-                        em=event_market(m.get('ticker',''),scan)
+                        ticker=m.get('ticker','')
+
+                        if ticker not in prior_cache:
+                            prior_cache[ticker]=prior_market(ticker,started)
+                        pm=prior_cache[ticker]
+
+                        if ticker not in event_cache_lookup:
+                            event_cache_lookup[ticker]=event_market(ticker,scan)
+                        em=event_cache_lookup[ticker]
+
                         nws_confirms=None
                         if kind=='temperature' and cp is not None and pp is not None:
-                            nws_confirms=nws_confirms_direction(l['location_key'],date,cp-pp,started)
+                            nkey=(l['location_key'],date)
+                            if nkey not in nws_confirmation_cache:
+                                nws_confirmation_cache[nkey]=nws_confirms_direction(l['location_key'],date,cp-pp,started)
+                            nws_confirms=nws_confirmation_cache[nkey]
+
                         sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation',nws_confirms=nws_confirms)
                         if sig:
                             stats['forecast_shocks']+=1
