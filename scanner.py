@@ -153,10 +153,31 @@ def is_temp(s):
     return (not freq or freq=='daily') and 'lowest temperature' not in t and (x.startswith('KXHIGH') or 'highest temperature' in t or 'high temperature' in t or 'maximum temperature' in t)
 def is_rain(s):
     t=(s.get('title') or '').lower();x=(s.get('ticker') or '').upper();return x=='KXRAIN' or ((s.get('frequency') or '').lower()=='daily' and ('rain' in t or 'precipitation' in t))
+_TITLE_BOILERPLATE={'daily','maximum','max','high','highest','temperature','temp','rain','precipitation','will','it','where','the','today','on','in','weather','daly'}
+_CITY_ABBREV={'DC':'Washington','NYC':'New York City','SATX':'San Antonio','LV':'Las Vegas','SF':'San Francisco','LA':'Los Angeles'}
 def city_title(s):
     t=' '.join((s.get('title') or '').split())
+    if not t:return None
+    # Drop parenthetical airport codes, e.g. "Newark, NJ (EWR) Daily Max Temp".
+    t=' '.join(re.sub(r'\([^)]*\)','',t).split())
+    # Prefer the classic "<temperature|rain|precipitation> in <city>" phrasing when present.
     m=re.search(r'(?:temperature|rain|precipitation)\s+in\s+(.+?)(?:\s+today\??|\s+on\s+.+?\??$|\?$|$)',t,re.I)
-    return m.group(1).strip(' ?.') if m else None
+    if m:
+        cand=m.group(1).strip(' ?.,')
+        if cand:return _CITY_ABBREV.get(cand.upper(),cand)
+    # Otherwise strip known boilerplate tokens from both ends of the title.
+    # Kalshi's real weather-market titles are inconsistently ordered
+    # ("Seattle Maximum Temperature Daily", "Daily high temp Tokyo", "NYC rain")
+    # so requiring the word "in" (the old behavior) missed almost all of them.
+    tokens=[tok for tok in t.replace('-',' ').replace('?','').split(' ') if tok]
+    lo=0;hi=len(tokens)
+    while lo<hi and tokens[lo].strip('.,').lower() in _TITLE_BOILERPLATE:lo+=1
+    while hi>lo and tokens[hi-1].strip('.,').lower() in _TITLE_BOILERPLATE:hi-=1
+    cand=' '.join(tokens[lo:hi]).strip(' ,.')
+    # Drop a trailing ", ST" state abbreviation for geocoding, e.g. "Trenton, NJ" -> "Trenton".
+    cand=re.split(r',',cand)[0].strip()
+    if not cand:return None
+    return _CITY_ABBREV.get(cand.upper(),cand)
 
 def geocode(city):
     d=http(GEOCODING_API_URL,{'name':city,'count':5,'language':'en','format':'json','countryCode':'US'})
@@ -328,22 +349,36 @@ def save_forecasts(det,ens,observed):
                 rain_fp=forecast_revision_fingerprint('ensemble_rain_distribution',p)
                 q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
 
-def nws_updates(locations):
-    out={};changed={}
+def nws_grid_snapshot(locations):
+    """Fetch each location's NWS forecastGridData document exactly once per
+    scan and extract everything we need from it: the updateTime (used to
+    decide whether to also refresh the deterministic GFS pull) and the
+    official temperature/precipitation-probability values (used by
+    nws_confirms_direction()). Previously these were two separate HTTP
+    fetches of the same URL per location; this merges them into one."""
+    update_times={};changed={};grid_values={}
     for l in locations:
         try:
             url=l.get('nws_grid_url')
             if not url:
-                p=nws(f"{NWS_API_URL}/points/{l['latitude']},{l['longitude']}");url=(p.get('properties') or {}).get('forecastGridData');
+                p=nws(f"{NWS_API_URL}/points/{l['latitude']},{l['longitude']}");url=(p.get('properties') or {}).get('forecastGridData')
                 if url:q('UPDATE weather_locations SET nws_grid_url=%s,updated_at=NOW() WHERE location_key=%s',(url,l['location_key']))
             if not url:continue
-            d=nws(url);u=(d.get('properties') or {}).get('updateTime')
-            if not u:continue
-            dt=datetime.fromisoformat(u.replace('Z','+00:00'));out[l['location_key']]=dt
-            r=q("SELECT last_update_at FROM weather_service_state WHERE city_code=%s AND source='nws'",(l['location_key'],),one=True)
-            if not r or not r[0] or dt>r[0]:changed[l['location_key']]=dt
-        except Exception as e:log.warning('NWS update unavailable for %s: %s',l['city_name'],e)
-    return out,changed
+            d=nws(url);props=d.get('properties') or {}
+            u=props.get('updateTime')
+            if u:
+                dt=datetime.fromisoformat(u.replace('Z','+00:00'));update_times[l['location_key']]=dt
+                r=q("SELECT last_update_at FROM weather_service_state WHERE city_code=%s AND source='nws'",(l['location_key'],),one=True)
+                if not r or not r[0] or dt>r[0]:changed[l['location_key']]=dt
+            temp_block=(props.get('temperature') or {})
+            pop_block=(props.get('probabilityOfPrecipitation') or {})
+            temp_uom=str(temp_block.get('uom') or '').lower()
+            highs=expand_grid_series(temp_block.get('values'),l['timezone'],'degc' in temp_uom or 'wmounit:degc' in temp_uom,agg='max')
+            pops=expand_grid_series(pop_block.get('values'),l['timezone'],False,agg='max')
+            if highs:
+                grid_values[l['location_key']]={'daily_high_f':highs,'daily_pop_max':pops,'update_time':u}
+        except Exception as e:log.warning('NWS grid unavailable for %s: %s',l['city_name'],e)
+    return update_times,changed,grid_values
 def save_nws(us,locs):
     for k,u in us.items():
         l=locs.get(k)
@@ -428,30 +463,6 @@ def expand_grid_series(values,tz,unit_is_celsius,agg='max'):
     out={}
     for day,vals in by_day.items():
         out[day]=max(vals) if agg=='max' else sum(vals)/len(vals)
-    return out
-
-def fetch_nws_grid_values(locations):
-    """Pull the official NWS gridpoint temperature/precip-probability forecast
-    per location. Returns {location_key: {'daily_high_f':{date:val}, 'daily_pop_max':{date:val}, 'update_time':iso}}"""
-    out={}
-    for l in locations:
-        try:
-            url=l.get('nws_grid_url')
-            if not url:
-                p=nws(f"{NWS_API_URL}/points/{l['latitude']},{l['longitude']}")
-                url=(p.get('properties') or {}).get('forecastGridData')
-                if not url:continue
-            d=nws(url);props=d.get('properties') or {}
-            update_time=props.get('updateTime')
-            temp_block=(props.get('temperature') or {})
-            pop_block=(props.get('probabilityOfPrecipitation') or {})
-            temp_uom=str(temp_block.get('uom') or '').lower()
-            highs=expand_grid_series(temp_block.get('values'),l['timezone'],'degc' in temp_uom or 'wmounit:degc' in temp_uom,agg='max')
-            pops=expand_grid_series(pop_block.get('values'),l['timezone'],False,agg='max')
-            if highs:
-                out[l['location_key']]={'daily_high_f':highs,'daily_pop_max':pops,'update_time':update_time}
-        except Exception as e:
-            log.warning('NWS gridpoint values unavailable for %s: %s',l['city_name'],e)
     return out
 
 def save_nws_grid_values(nws_grid,observed,stats):
@@ -695,14 +706,35 @@ def observe(stats,before):
             f'{volume:.0f}' if volume is not None else 'n/a')
 
 def run_scan():
-    stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0,'nws_grid_values_saved':0}
+    stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0,'nws_grid_values_saved':0,'phase_seconds':{}}
     scan=None
     started=now();
+    def phase(name,t0):
+        dt=time.time()-t0
+        stats['phase_seconds'][name]=round(dt,1)
+        log.info('PHASE %s | %.1fs',name,dt)
+        return time.time()
+    t=time.time()
     try:
         schema();scan=q("INSERT INTO scan_runs(started_at,status,stats,schema_version) VALUES(NOW(),'running','{}'::jsonb,%s) RETURNING id",(SCHEMA_VERSION,),one=True)[0];settle(stats)
+        t=phase('schema_and_settle',t)
         xs=series_list();save_series(xs);te,re=discover(xs);stats['temperature_series']=len(te);stats['rain_series']=len(re);stats['weather_locations_discovered']=len({l['location_key'] for _,l in te+re})
+        t=phase('series_discovery',t)
         c={'temperature':cache(te),'rain':cache(re)};snapshot(c,scan,'scan_start',stats,count_markets=True)
-        locs={l['location_key']:l for _,l in te+re};us,ch=nws_updates(list(locs.values()));stats['nws_updates_detected']=len(ch)
+        t=phase('scan_start_snapshot',t)
+        locs={l['location_key']:l for _,l in te+re}
+
+        # Single pass over each location's NWS grid document: gets both the
+        # updateTime (used below to decide whether to refresh deterministic
+        # GFS) and the official temperature/PoP values, instead of fetching
+        # the same URL twice.
+        us,ch,nws_grid=nws_grid_snapshot(list(locs.values()));stats['nws_updates_detected']=len(ch)
+        t=phase('nws_grid_snapshot',t)
+        try:
+            save_nws_grid_values(nws_grid,now(),stats)
+        except Exception as e:
+            log.warning('Could not save NWS grid values: %s',e)
+        t=phase('nws_grid_save',t)
 
         det={}
         ens={}
@@ -714,6 +746,7 @@ def run_scan():
                 stats['deterministic_gfs_ok']=True
             except Exception as e:
                 log.warning('Deterministic GFS unavailable: %s',e)
+        t=phase('fetch_det',t)
 
         try:
             stats['ensemble_fetch_attempted']=True
@@ -722,22 +755,17 @@ def run_scan():
         except Exception as e:
             log.warning('Ensemble forecast unavailable: %s',e)
             ens={}
+        t=phase('fetch_ens',t)
 
         observed=now()
-
-        # Real NWS gridpoint values, fetched every scan regardless of whether
-        # fetch_ens() succeeded, so the confirmation signal stays up to date.
-        try:
-            nws_grid=fetch_nws_grid_values(list(locs.values()))
-            save_nws_grid_values(nws_grid,observed,stats)
-        except Exception as e:
-            log.warning('NWS gridpoint values unavailable this scan: %s',e)
 
         if ens:
             stats['weather_refreshed']=True
             event_cache={'temperature':cache(te),'rain':cache(re)}
             snapshot(event_cache,scan,'forecast_event',stats,count_markets=False)
+            t=phase('event_snapshot',t)
             process_research(event_cache,ens,started,scan,observed,stats)
+            t=phase('process_research',t)
 
             for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
                 if kind=='rain' and not ALLOW_RAIN_PAPER_SIGNALS:
@@ -770,12 +798,15 @@ def run_scan():
                                 stats['rain_forecast_shocks']+=1
                             paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url'),'market_observed_at':sig.get('market_observed_at'),'yes_bid_cents':sig.get('yes_bid_cents'),'yes_ask_cents':sig.get('yes_ask_cents'),'no_bid_cents':sig.get('no_bid_cents'),'no_ask_cents':sig.get('no_ask_cents'),'last_price_cents':sig.get('last_price_cents'),'spread_yes_cents':sig.get('spread_yes_cents'),'spread_no_cents':sig.get('spread_no_cents'),'volume':sig.get('volume'),'open_interest':sig.get('open_interest')},stats)
 
+            t=phase('candidate_loop',t)
             save_forecasts(det,ens,observed)
+            t=phase('save_forecasts',t)
 
         if ch:
             save_nws(us,locs)
 
         observe(stats,started);close_research_events(stats);settle(stats)
+        t=phase('observe_close_settle',t)
         q('UPDATE scan_runs SET completed_at=NOW(),status=\'success\',stats=%s,schema_version=%s WHERE id=%s',(J(stats),SCHEMA_VERSION,scan));log.info('SCAN COMPLETE | %s | runtime=%.1fs',json.dumps(stats,default=str), (now()-started).total_seconds())
     except Exception as e:
         log.exception('SCAN FAILED')
