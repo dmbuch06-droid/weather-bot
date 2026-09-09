@@ -433,22 +433,61 @@ def signal_allowed(l,kind):
     return bool(l.get('settlement_verified') and l.get('signal_enabled'))
 
 def save_forecasts(det,ens,observed):
+    rows=[]
     for k,d in det.items():
-        l=getloc(k);city=l['city_name']
+        l=getloc(k)
+        if not l:
+            continue
+        city=l['city_name']
         for date,x in d['daily'].items():
-            for var,val,p in [('temperature_high',x['high'],x),('precipitation_sum',x['precipitation_sum'],x)]:
-                p={**p,'model_run':d.get('model_run'),'location_key':k}
-                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,var,DETERMINISTIC_MODEL,date,val,J(p),h(p),observed,MEASUREMENT_VERSION))
+            for var,val,p0 in [('temperature_high',x['high'],x),('precipitation_sum',x['precipitation_sum'],x)]:
+                p={**p0,'model_run':d.get('model_run'),'location_key':k}
+                rows.append((city,var,DETERMINISTIC_MODEL,date,val,J(p),h(p),observed,MEASUREMENT_VERSION))
+
     for k,d in ens.items():
-        l=getloc(k);city=l['city_name']
+        l=getloc(k)
+        if not l:
+            continue
+        city=l['city_name']
         for date,x in d['daily'].items():
-            p={'member_highs':x['member_highs'],'member_highs_rounded':[round_temp(v) for v in x['member_highs']],'member_precip_totals':x['member_precip_totals'],'temperature_mean':x['temperature_mean'],'temperature_median':x['temperature_median'],'temperature_member_count':d['temperature_member_count'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
+            p={
+                'member_highs':x['member_highs'],
+                'member_highs_rounded':[round_temp(v) for v in x['member_highs']],
+                'member_precip_totals':x['member_precip_totals'],
+                'temperature_mean':x['temperature_mean'],
+                'temperature_median':x['temperature_median'],
+                'temperature_member_count':d['temperature_member_count'],
+                'precipitation_member_count':d['precipitation_member_count'],
+                'model_run':d.get('model_run'),
+                'location_key':k
+            }
             temp_fp=forecast_revision_fingerprint('ensemble_temperature_distribution',p)
-            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_temperature_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,x['temperature_mean'],J(p),temp_fp,observed,MEASUREMENT_VERSION))
+            rows.append((city,'ensemble_temperature_distribution',ENSEMBLE_MODEL,date,x['temperature_mean'],J(p),temp_fp,observed,MEASUREMENT_VERSION))
+
             if x['member_precip_totals']:
-                p={'member_precip_totals':x['member_precip_totals'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
+                p={
+                    'member_precip_totals':x['member_precip_totals'],
+                    'precipitation_member_count':d['precipitation_member_count'],
+                    'model_run':d.get('model_run'),
+                    'location_key':k
+                }
                 rain_fp=forecast_revision_fingerprint('ensemble_rain_distribution',p)
-                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
+                rows.append((city,'ensemble_rain_distribution',ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
+
+    if not rows:
+        return
+
+    sql = 'INSERT INTO forecast_observations(\n        observed_at,city,variable,model,forecast_date,scalar_value,\n        payload,payload_hash,source_observed_at,measurement_version\n    ) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s)\n    ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING'
+    c=db()
+    try:
+        with c.cursor() as cur:
+            cur.executemany(sql,rows)
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 def nws_grid_snapshot(locations):
     """Fetch each location's NWS forecastGridData document exactly once per
