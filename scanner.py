@@ -24,7 +24,7 @@ NWS_API_URL='https://api.weather.gov'
 NWS_USER_AGENT=os.environ.get('NWS_USER_AGENT','WeatherKalshiResearchBot/7.0')
 GEOCODING_API_URL='https://geocoding-api.open-meteo.com/v1/search'
 ENSEMBLE_MODEL='gfs_seamless'; DETERMINISTIC_MODEL='gfs_seamless'
-SCHEMA_VERSION=9; MEASUREMENT_VERSION='v9_market_audit_exact_contract'
+SCHEMA_VERSION=10; MEASUREMENT_VERSION='v10_incremental_forecast_tracking'
 MIN_FORECAST_PROBABILITY_CHANGE_POINTS=float(os.environ.get('MIN_FORECAST_PROBABILITY_CHANGE_POINTS','20'))
 MIN_MARKET_LAG_POINTS=float(os.environ.get('MIN_MARKET_LAG_POINTS','10'))
 MIN_PRELIMINARY_EDGE_POINTS=float(os.environ.get('MIN_PRELIMINARY_EDGE_POINTS','10'))
@@ -279,7 +279,39 @@ def forecast_model_run(payload):
     if not isinstance(payload,dict):return None
     return payload.get('model_run') or payload.get('model_run_id') or payload.get('model_run_time')
 
-def forecast_payload_fingerprint(payload):
+def forecast_revision_fingerprint(variable,payload):
+    if not isinstance(payload,dict):
+        return None
+
+    run=forecast_model_run(payload)
+
+    if variable=='ensemble_temperature_distribution':
+        vals=payload.get('member_highs_rounded')
+        if vals is None:
+            vals=[round_temp(v) for v in (payload.get('member_highs') or [])]
+        vals=[int(v) for v in vals if v is not None]
+        return h({
+            'variable':variable,
+            'model_run':run,
+            'member_highs_rounded':vals,
+        })
+
+    if variable=='ensemble_rain_distribution':
+        vals=[
+            1 if f(v) is not None and f(v)>0 else 0
+            for v in (payload.get('member_precip_totals') or [])
+        ]
+        return h({
+            'variable':variable,
+            'model_run':run,
+            'member_wet_flags':vals,
+        })
+
+    return h({'variable':variable,'model_run':run})
+
+def forecast_payload_fingerprint(payload,variable=None):
+    if variable:
+        return forecast_revision_fingerprint(variable,payload)
     return h(payload) if isinstance(payload,dict) else None
 
 def signal_allowed(l,kind):
@@ -294,15 +326,18 @@ def save_forecasts(det,ens,observed):
         l=getloc(k);city=l['city_name']
         for date,x in d['daily'].items():
             for var,val,p in [('temperature_high',x['high'],x),('precipitation_sum',x['precipitation_sum'],x)]:
-                p={**p,'model_run':d.get('model_run'),'location_key':k};q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,var,DETERMINISTIC_MODEL,date,val,J(p),h(p),observed,MEASUREMENT_VERSION))
+                p={**p,'model_run':d.get('model_run'),'location_key':k}
+                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,var,DETERMINISTIC_MODEL,date,val,J(p),h(p),observed,MEASUREMENT_VERSION))
     for k,d in ens.items():
         l=getloc(k);city=l['city_name']
         for date,x in d['daily'].items():
             p={'member_highs':x['member_highs'],'member_highs_rounded':[round_temp(v) for v in x['member_highs']],'member_precip_totals':x['member_precip_totals'],'temperature_mean':x['temperature_mean'],'temperature_median':x['temperature_median'],'temperature_member_count':d['temperature_member_count'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
-            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_temperature_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,x['temperature_mean'],J(p),h(p),observed,MEASUREMENT_VERSION))
+            temp_fp=forecast_revision_fingerprint('ensemble_temperature_distribution',p)
+            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_temperature_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,x['temperature_mean'],J(p),temp_fp,observed,MEASUREMENT_VERSION))
             if x['member_precip_totals']:
                 p={'member_precip_totals':x['member_precip_totals'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
-                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),h(p),observed,MEASUREMENT_VERSION))
+                rain_fp=forecast_revision_fingerprint('ensemble_rain_distribution',p)
+                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload, payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
 
 def nws_updates(locations):
     out={};changed={}
@@ -376,7 +411,7 @@ def create_research(l,date,var,m,prevp,curp,preask,eventask,scan,observed,stats)
     market_ch=eventask-preask
     lag=side_ch-market_ch
     edge=cur_side-eventask
-    fp=h({'city':l['city_name'],'date':date,'var':var,'ticker':m.get('ticker'),'side':side,'previous':round(prevp,6),'current':round(curp,6)})[:32]
+    fp=h({'city':l['city_name'],'date':date,'var':var,'ticker':m.get('ticker'),'side':side,'previous':round(prevp,6),'current':round(curp,6),'scan_id':scan})[:32]
     r=q("""INSERT INTO forecast_research_events(event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,previous_probability,current_probability,forecast_probability_change_points,pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,initial_market_lag_points,initial_preliminary_edge_points,status,scan_id,forecast_observed_at,measurement_version,settlement_verified,location_key) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(event_fingerprint) DO NOTHING RETURNING id""",(fp,l['city_name'],date,var,m.get('ticker',''),side,prev_side,cur_side,side_ch,preask,eventask,market_ch,lag,edge,'open' if lag>0 else 'no_initial_lag',scan,observed,MEASUREMENT_VERSION,l['settlement_verified'],l['location_key']),one=True)
     if r:stats['research_events_created']+=1
 
@@ -399,31 +434,23 @@ def process_research(cache,ens,before,scan,observed,stats):
                     continue
                 prev_payload=prev['payload'] or {}
                 current_run=ens.get(l['location_key'],{}).get('model_run')
-                previous_run=forecast_model_run(prev_payload)
                 if kind=='temperature':
                     current_payload={
                         'member_highs':d.get('member_highs') or [],
-                        'temperature_mean':d.get('temperature_mean'),
-                        'temperature_median':d.get('temperature_median'),
-                        'temperature_member_count':ens.get(l['location_key'],{}).get('temperature_member_count'),
+                        'member_highs_rounded':[round_temp(v) for v in (d.get('member_highs') or [])],
                         'model_run':current_run,
                     }
+                    variable_key='ensemble_temperature_distribution'
                 else:
                     current_payload={
                         'member_precip_totals':d.get('member_precip_totals') or [],
-                        'precipitation_member_count':ens.get(l['location_key'],{}).get('precipitation_member_count'),
                         'model_run':current_run,
                     }
-                current_fp=forecast_payload_fingerprint(current_payload)
-                previous_fp=forecast_payload_fingerprint(prev_payload)
-                if not current_fp or not previous_fp:
-                    continue
-                # Open-Meteo may omit model-run metadata. A changed normalized forecast
-                # payload is still a real forecast revision and is exactly what this bot
-                # is designed to detect. If both run IDs exist, keep the extra safeguard.
-                if current_run and previous_run and current_run==previous_run and current_fp==previous_fp:
-                    continue
-                if current_fp==previous_fp:
+                    variable_key='ensemble_rain_distribution'
+
+                current_fp=forecast_revision_fingerprint(variable_key,current_payload)
+                previous_fp=forecast_revision_fingerprint(variable_key,prev_payload)
+                if not current_fp or not previous_fp or current_fp==previous_fp:
                     continue
                 prevvals=prev_payload.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
                 cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals)
@@ -446,13 +473,14 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature'):
     if cp is None or pp is None or not pm or not em or abs(cp-pp)<MIN_FORECAST_PROBABILITY_CHANGE_POINTS:return None
     if not signal_allowed(l,'rain' if kind=='precipitation' else 'temperature'):return None
     best=None
-    ch=cp-pp
-    for side in ('YES','NO'):
+    forecast_change=cp-pp
+    sides=('YES',) if forecast_change>0 else ('NO',)
+    for side in sides:
         ask=em[2] if side=='YES' else em[4]
         prev=pm[2] if side=='YES' else pm[4]
         if ask is None or prev is None or not MIN_ENTRY_PRICE_CENTS<=ask<=MAX_ENTRY_PRICE_CENTS:continue
         sp=cp if side=='YES' else 100-cp
-        sch=abs(ch)
+        sch=abs(forecast_change)
         mc=ask-prev
         lag=sch-mc
         edge=sp-ask
@@ -569,50 +597,81 @@ def observe(stats,before):
             f'{volume:.0f}' if volume is not None else 'n/a')
 
 def run_scan():
-    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0}
+    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0}
     started=now();
     try:
         schema();scan=q("INSERT INTO scan_runs(started_at,status,stats,schema_version) VALUES(NOW(),'running','{}'::jsonb,%s) RETURNING id",(SCHEMA_VERSION,),one=True)[0];settle(stats)
         xs=series_list();save_series(xs);te,re=discover(xs);stats['temperature_series']=len(te);stats['rain_series']=len(re);stats['weather_locations_discovered']=len({l['location_key'] for _,l in te+re})
         c={'temperature':cache(te),'rain':cache(re)};snapshot(c,scan,'scan_start',stats,count_markets=True)
         locs={l['location_key']:l for _,l in te+re};us,ch=nws_updates(list(locs.values()));stats['nws_updates_detected']=len(ch)
+
+        det={}
+        ens={}
+        observed=now()
+
+        # Deterministic GFS remains NWS-gated because it is supplementary data.
         if ch:
-            stats['weather_refreshed']=False
-            try:det=fetch_det(list(locs.values()));stats['deterministic_gfs_ok']=True
-            except Exception as e:log.warning('Deterministic GFS unavailable: %s',e);det={}
             try:
-                ens=fetch_ens(list(locs.values()));stats['ensemble_ok']=True
+                det=fetch_det(list(locs.values()))
+                stats['deterministic_gfs_ok']=True
             except Exception as e:
-                log.warning('Ensemble forecast unavailable: %s',e);ens={}
-            observed=now()
-            if ens:
-                stats['weather_refreshed']=True
-                # Re-fetch market data after the weather refresh. The event snapshot
-                # must represent the market at/after the forecast change, not a
-                # second copy of the scan-start snapshot.
-                event_cache={'temperature':cache(te),'rain':cache(re)}
-                snapshot(event_cache,scan,'forecast_event',stats,count_markets=False)
-                process_research(event_cache,ens,started,scan,observed,stats)
+                log.warning('Deterministic GFS unavailable: %s',e)
+
+        # Ensemble data is the primary forecast-change signal, so fetch it every scan.
+        # This avoids missing Open-Meteo revisions that do not coincide with an NWS update.
+        try:
+            stats['ensemble_fetch_attempted']=True
+            ens=fetch_ens(list(locs.values()))
+            stats['ensemble_ok']=True
+        except Exception as e:
+            log.warning('Ensemble forecast unavailable: %s',e)
+            ens={}
+
+        observed=now()
+
+        if ens:
+            stats['weather_refreshed']=True
+            # Re-fetch market data after the weather refresh. The event snapshot
+            # must represent the market at/after the forecast change, not a
+            # second copy of the scan-start snapshot.
+            event_cache={'temperature':cache(te),'rain':cache(re)}
+            snapshot(event_cache,scan,'forecast_event',stats,count_markets=False)
+            process_research(event_cache,ens,started,scan,observed,stats)
+
             for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
-                if not ens:
-                    break
                 if kind=='rain' and not ALLOW_RAIN_PAPER_SIGNALS:
                     continue
                 for s,l,ms in entries:
-                    if not l['settlement_verified'] and not ALLOW_UNVERIFIED_LOCATION_SIGNALS:continue
+                    if not l['settlement_verified'] and not ALLOW_UNVERIFIED_LOCATION_SIGNALS:
+                        continue
                     for m in ms:
-                        date=date_market(m);d=ens.get(l['location_key'],{}).get('daily',{}).get(date or '')
-                        if not d:continue
-                        cur=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];prev=forecast_prev(l['city_name'],'ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution',date,started)
-                        if not prev:continue
-                        old=prev['payload'].get('member_highs' if kind=='temperature' else 'member_precip_totals') or [];cp=tprob(cur,m) if kind=='temperature' else rprob(cur);pp=tprob(old,m) if kind=='temperature' else rprob(old);pm=prior_market(m.get('ticker',''),started);em=event_market(m.get('ticker',''),scan);sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
+                        date=date_market(m)
+                        d=ens.get(l['location_key'],{}).get('daily',{}).get(date or '')
+                        if not d:
+                            continue
+                        cur=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
+                        variable_key='ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution'
+                        prev=forecast_prev(l['city_name'],variable_key,date,started)
+                        if not prev:
+                            continue
+                        old=prev['payload'].get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
+                        cp=tprob(cur,m) if kind=='temperature' else rprob(cur)
+                        pp=tprob(old,m) if kind=='temperature' else rprob(old)
+                        pm=prior_market(m.get('ticker',''),started)
+                        em=event_market(m.get('ticker',''),scan)
+                        sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
                         if sig:
                             stats['forecast_shocks']+=1
-                            if kind=='rain':stats['rain_forecast_shocks']+=1
+                            if kind=='rain':
+                                stats['rain_forecast_shocks']+=1
                             paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url'),'market_observed_at':sig.get('market_observed_at'),'yes_bid_cents':sig.get('yes_bid_cents'),'yes_ask_cents':sig.get('yes_ask_cents'),'no_bid_cents':sig.get('no_bid_cents'),'no_ask_cents':sig.get('no_ask_cents'),'last_price_cents':sig.get('last_price_cents'),'spread_yes_cents':sig.get('spread_yes_cents'),'spread_no_cents':sig.get('spread_no_cents'),'volume':sig.get('volume'),'open_interest':sig.get('open_interest')},stats)
-            if ens:
-                save_forecasts(det,ens,observed)
-                save_nws(us,locs)
+
+            save_forecasts(det,ens,observed)
+
+        # Persist the NWS update marker even if an ensemble request failed.
+        if ch:
+            save_nws(us,locs)
+
         observe(stats,started);close_research_events(stats);settle(stats)
         q('UPDATE scan_runs SET completed_at=NOW(),status=\'success\',stats=%s,schema_version=%s WHERE id=%s',(J(stats),SCHEMA_VERSION,scan));log.info('SCAN COMPLETE | %s | runtime=%.1fs',json.dumps(stats,default=str), (now()-started).total_seconds())
     except Exception as e:
