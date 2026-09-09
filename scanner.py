@@ -11,6 +11,9 @@ except ImportError:
     psycopg2 = None
     Json = None
 
+def J(value):
+    return Json(value, dumps=lambda obj: json.dumps(obj, default=str)) if Json is not None else value
+
 KALSHI_API_URL=os.environ.get('KALSHI_API_URL','https://external-api.kalshi.com/trade-api/v2').rstrip('/')
 DATABASE_URL=os.environ.get('DATABASE_URL','').strip()
 DISCORD_RELAY_URL=os.environ.get('DISCORD_RELAY_URL','').strip()
@@ -142,7 +145,7 @@ def save_series(xs):
     c=db()
     try:
         with c.cursor() as cur:
-            cur.executemany('''INSERT INTO series_registry(series_ticker,title,category,tags,settlement_sources,contract_terms_url,updated_at,raw_series) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s) ON CONFLICT(series_ticker) DO UPDATE SET title=EXCLUDED.title,category=EXCLUDED.category,tags=EXCLUDED.tags,settlement_sources=EXCLUDED.settlement_sources,contract_terms_url=EXCLUDED.contract_terms_url,updated_at=NOW(),raw_series=EXCLUDED.raw_series''',[(x.get('ticker'),x.get('title',''),x.get('category'),Json(x.get('tags') or []),Json(x.get('settlement_sources') or []),x.get('contract_terms_url'),Json(x)) for x in xs if x.get('ticker')])
+            cur.executemany('''INSERT INTO series_registry(series_ticker,title,category,tags,settlement_sources,contract_terms_url,updated_at,raw_series) VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s) ON CONFLICT(series_ticker) DO UPDATE SET title=EXCLUDED.title,category=EXCLUDED.category,tags=EXCLUDED.tags,settlement_sources=EXCLUDED.settlement_sources,contract_terms_url=EXCLUDED.contract_terms_url,updated_at=NOW(),raw_series=EXCLUDED.raw_series''',[(x.get('ticker'),x.get('title',''),x.get('category'),J(x.get('tags') or []),J(x.get('settlement_sources') or []),x.get('contract_terms_url'),J(x)) for x in xs if x.get('ticker')])
         c.commit()
     except: c.rollback();raise
     finally:c.close()
@@ -182,7 +185,7 @@ def loc_for(s):
         log.warning('Skipping non-populated-place geocode for %s: %s (%s)', city, g.get('name'), feature)
         return None
     k=slug('_'.join(x for x in [g.get('name'),g.get('admin1'),g.get('country_code')] if x))
-    q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),Json(g)))
+    q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),J(g)))
     return getloc(k)
 def rowloc(r):
     return {'location_key':r[0],'city_name':r[1],'latitude':r[2],'longitude':r[3],'timezone':r[4],'settlement_verified':bool(r[5]),'signal_enabled':bool(r[6]),'mapping_method':r[7],'nws_grid_url':r[8]}
@@ -291,15 +294,15 @@ def save_forecasts(det,ens,observed):
         l=getloc(k);city=l['city_name']
         for date,x in d['daily'].items():
             for var,val,p in [('temperature_high',x['high'],x),('precipitation_sum',x['precipitation_sum'],x)]:
-                p={**p,'model_run':d.get('model_run'),'location_key':k};q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,var,DETERMINISTIC_MODEL,date,val,Json(p),h(p),observed,MEASUREMENT_VERSION))
+                p={**p,'model_run':d.get('model_run'),'location_key':k};q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,var,DETERMINISTIC_MODEL,date,val,J(p),h(p),observed,MEASUREMENT_VERSION))
     for k,d in ens.items():
         l=getloc(k);city=l['city_name']
         for date,x in d['daily'].items():
             p={'member_highs':x['member_highs'],'member_highs_rounded':[round_temp(v) for v in x['member_highs']],'member_precip_totals':x['member_precip_totals'],'temperature_mean':x['temperature_mean'],'temperature_median':x['temperature_median'],'temperature_member_count':d['temperature_member_count'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
-            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_temperature_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,x['temperature_mean'],Json(p),h(p),observed,MEASUREMENT_VERSION))
+            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_temperature_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,x['temperature_mean'],J(p),h(p),observed,MEASUREMENT_VERSION))
             if x['member_precip_totals']:
                 p={'member_precip_totals':x['member_precip_totals'],'precipitation_member_count':d['precipitation_member_count'],'model_run':d.get('model_run'),'location_key':k}
-                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),Json(p),h(p),observed,MEASUREMENT_VERSION))
+                q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'ensemble_rain_distribution\',%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),h(p),observed,MEASUREMENT_VERSION))
 
 def nws_updates(locations):
     out={};changed={}
@@ -465,7 +468,7 @@ def paper(signal,reason,stats):
         entry=signal['entry_price_cents']/100
         if entry<=0:return
         contracts=max(1,int(PAPER_RISK_DOLLARS/entry));stake=contracts*entry
-        inserted=q("""INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status,measurement_version) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s) ON CONFLICT(signal_fingerprint) DO NOTHING RETURNING id""",(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,Json(reason),MEASUREMENT_VERSION),one=True)
+        inserted=q("""INSERT INTO paper_trades(signal_fingerprint,created_at,city,forecast_date,market_ticker,market_kind,side,entry_price_cents,stake_dollars,contracts,model_probability_proxy,preliminary_edge_points,forecast_probability_change_points,market_price_change_points,market_lag_points,forecast_temperature_change_f,reason,status,measurement_version) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s) ON CONFLICT(signal_fingerprint) DO NOTHING RETURNING id""",(fp,signal['city'],signal['forecast_date'],signal['market_ticker'],signal['market_kind'],signal['side'],signal['entry_price_cents'],stake,contracts,signal['model_probability_proxy'],signal['preliminary_edge_points'],signal['forecast_probability_change_points'],signal['market_price_change_points'],signal['market_lag_points'],None,J(reason),MEASUREMENT_VERSION),one=True)
         if not inserted: existing=True
         else: stats['paper_trades_created']+=1
     if q('SELECT 1 FROM alert_log WHERE fingerprint=%s',(fp,),one=True):return
@@ -478,7 +481,7 @@ def paper(signal,reason,stats):
     try:
         r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/8.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
         if r is not None and 200<=r.status_code<300:
-            q('INSERT INTO alert_log(fingerprint,sent_at,payload,measurement_version) VALUES(%s,NOW(),%s,%s) ON CONFLICT DO NOTHING',(fp,Json({**signal,'alert_observed_at_utc':observed_text,'contract_label':signal.get('contract_label')}),MEASUREMENT_VERSION))
+            q('INSERT INTO alert_log(fingerprint,sent_at,payload,measurement_version) VALUES(%s,NOW(),%s,%s) ON CONFLICT DO NOTHING',(fp,J({**signal,'alert_observed_at_utc':observed_text,'contract_label':signal.get('contract_label')}),MEASUREMENT_VERSION))
             stats['discord_alerts']+=1
     except Exception as e:log.error('Discord relay failed: %s',e)
 
@@ -611,11 +614,11 @@ def run_scan():
                 save_forecasts(det,ens,observed)
                 save_nws(us,locs)
         observe(stats,started);close_research_events(stats);settle(stats)
-        q('UPDATE scan_runs SET completed_at=NOW(),status=\'success\',stats=%s,schema_version=%s WHERE id=%s',(Json(stats),SCHEMA_VERSION,scan));log.info('SCAN COMPLETE | %s | runtime=%.1fs',json.dumps(stats,default=str), (now()-started).total_seconds())
+        q('UPDATE scan_runs SET completed_at=NOW(),status=\'success\',stats=%s,schema_version=%s WHERE id=%s',(J(stats),SCHEMA_VERSION,scan));log.info('SCAN COMPLETE | %s | runtime=%.1fs',json.dumps(stats,default=str), (now()-started).total_seconds())
     except Exception as e:
         log.exception('SCAN FAILED')
         if scan:
-            q('UPDATE scan_runs SET completed_at=NOW(),status=\'failed\',stats=%s,error=%s,schema_version=%s WHERE id=%s',(Json(stats),str(e),SCHEMA_VERSION,scan))
+            q('UPDATE scan_runs SET completed_at=NOW(),status=\'failed\',stats=%s,error=%s,schema_version=%s WHERE id=%s',(J(stats),str(e),SCHEMA_VERSION,scan))
         raise
     finally:close_db()
 
