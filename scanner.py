@@ -48,8 +48,6 @@ def local_date(ts,tz): return datetime.fromisoformat(str(ts).replace('Z','+00:00
 def round_temp(v):
     v=f(v)
     if v is None:return None
-    # Settlement values are whole degrees. Use decimal half-up so negative
-    # temperatures do not get Python's float/floor edge-case behavior.
     return int(Decimal(str(v)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
 
 def db():
@@ -173,16 +171,18 @@ def loc_for(s):
         if p in x:
             r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
     city=city_title(s)
-    if not city:return None
+    if not city:
+        log.warning('MAPPING SKIP | ticker=%s | reason=no_city_parsed_from_title | title=%r',s.get('ticker'),s.get('title'))
+        return None
     r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE lower(city_name)=lower(%s) LIMIT 1',(city,),one=True)
     if r:return rowloc(r)
     g=geocode(city)
-    if not g:return None
+    if not g:
+        log.warning('MAPPING SKIP | ticker=%s | reason=geocode_no_match | parsed_city=%r',s.get('ticker'),city)
+        return None
     feature=str(g.get('feature_code') or '').upper()
-    # Dynamic mappings are research-only unless they look like a populated place.
-    # This prevents non-city Kalshi titles from becoming weather locations.
     if not feature.startswith('PPL'):
-        log.warning('Skipping non-populated-place geocode for %s: %s (%s)', city, g.get('name'), feature)
+        log.warning('MAPPING SKIP | ticker=%s | reason=non_populated_place | parsed_city=%r | geocode_name=%r | feature_code=%s', s.get('ticker'), city, g.get('name'), feature)
         return None
     k=slug('_'.join(x for x in [g.get('name'),g.get('admin1'),g.get('country_code')] if x))
     q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),J(g)))
@@ -193,14 +193,18 @@ def getloc(k):
     r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
 
 def discover(xs):
-    temps=[];rains=[];seen_t=set();seen_r=set()
+    temps=[];rains=[];seen_t=set();seen_r=set();skipped_temp=0;skipped_rain=0
     for s in xs:
         if is_temp(s):
             l=loc_for(s)
             if l:temps.append((s,l))
+            else:skipped_temp+=1
         elif is_rain(s):
             l=loc_for(s)
             if l:rains.append((s,l))
+            else:skipped_rain+=1
+    if skipped_temp or skipped_rain:
+        log.warning('MAPPING SUMMARY | temperature_series_skipped=%d | rain_series_skipped=%d (see MAPPING SKIP lines above for which tickers and why)',skipped_temp,skipped_rain)
     by={}
     for s,l in temps:
         by.setdefault(l['location_key'],[]).append((s,l))
@@ -228,6 +232,7 @@ def date_market(m):
         for p in s.split('-'):
             try:return datetime.strptime(p,'%y%b%d').date().isoformat()
             except:pass
+    log.warning('MAPPING SKIP | ticker=%s | event_ticker=%s | reason=unparseable_date_in_ticker',m.get('ticker'),m.get('event_ticker'))
     return None
 
 def cache(entries): return [(s,l,markets(s.get('ticker'))) for s,l in entries]
@@ -247,7 +252,6 @@ def contract_label(m):
     st=(m.get('strike_type') or '').lower()
     lo=f(m.get('floor_strike'));hi=f(m.get('cap_strike'))
     if st=='between' and lo is not None and hi is not None:
-        # Kalshi weather bracket metadata uses the actual whole-degree endpoints.
         low=int(Decimal(str(lo)).to_integral_value(rounding=ROUND_HALF_UP))
         high=int(Decimal(str(hi)).to_integral_value(rounding=ROUND_HALF_UP))
         return f'{low}°–{high}°'
@@ -282,31 +286,16 @@ def forecast_model_run(payload):
 def forecast_revision_fingerprint(variable,payload):
     if not isinstance(payload,dict):
         return None
-
     run=forecast_model_run(payload)
-
     if variable=='ensemble_temperature_distribution':
         vals=payload.get('member_highs_rounded')
         if vals is None:
             vals=[round_temp(v) for v in (payload.get('member_highs') or [])]
         vals=[int(v) for v in vals if v is not None]
-        return h({
-            'variable':variable,
-            'model_run':run,
-            'member_highs_rounded':vals,
-        })
-
+        return h({'variable':variable,'model_run':run,'member_highs_rounded':vals})
     if variable=='ensemble_rain_distribution':
-        vals=[
-            1 if f(v) is not None and f(v)>0 else 0
-            for v in (payload.get('member_precip_totals') or [])
-        ]
-        return h({
-            'variable':variable,
-            'model_run':run,
-            'member_wet_flags':vals,
-        })
-
+        vals=[1 if f(v) is not None and f(v)>0 else 0 for v in (payload.get('member_precip_totals') or [])]
+        return h({'variable':variable,'model_run':run,'member_wet_flags':vals})
     return h({'variable':variable,'model_run':run})
 
 def forecast_payload_fingerprint(payload,variable=None):
@@ -401,6 +390,109 @@ def fetch_ens(locs):
     if missing:raise RuntimeError('Ensemble missing daily temperature data for: '+', '.join(missing))
     return out
 
+# ---------------------------------------------------------------------------
+# Real NWS gridpoint forecast values (not just an update-time trigger).
+# forecastGridData returns time-series "values" blocks shaped like:
+#   {"validTime": "2026-01-01T06:00:00+00:00/PT6H", "value": 5.0}
+# where the second half of validTime is an ISO-8601 duration. We expand each
+# block across the local calendar day(s) it covers and take the daily max,
+# which is the NWS-forecaster-adjusted counterpart to the raw GFS ensemble
+# "member_highs" used elsewhere in this file.
+# ---------------------------------------------------------------------------
+_ISO_DUR_RE=re.compile(r'^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$')
+def parse_iso8601_duration(s):
+    m=_ISO_DUR_RE.match(s or '')
+    if not m:return None
+    days,hrs,mins=(int(g) if g else 0 for g in m.groups())
+    from datetime import timedelta
+    return timedelta(days=days,hours=hrs,minutes=mins)
+
+def expand_grid_series(values,tz,unit_is_celsius,agg='max'):
+    from datetime import timedelta
+    by_day=defaultdict(list)
+    for entry in values or []:
+        vt=entry.get('validTime');val=f(entry.get('value'))
+        if not vt or val is None or '/' not in vt:continue
+        start_s,dur_s=vt.split('/',1)
+        try:start=datetime.fromisoformat(start_s.replace('Z','+00:00'))
+        except Exception:continue
+        dur=parse_iso8601_duration(dur_s)
+        if dur is None:continue
+        total_hours=max(1,int(dur.total_seconds()//3600))
+        v=val*9/5+32 if unit_is_celsius else val
+        for hstep in range(0,total_hours,1):
+            t=start+timedelta(hours=hstep)
+            try:day=local_date(t.isoformat(),tz)
+            except Exception:continue
+            by_day[day].append(v)
+    out={}
+    for day,vals in by_day.items():
+        out[day]=max(vals) if agg=='max' else sum(vals)/len(vals)
+    return out
+
+def fetch_nws_grid_values(locations):
+    """Pull the official NWS gridpoint temperature/precip-probability forecast
+    per location. Returns {location_key: {'daily_high_f':{date:val}, 'daily_pop_max':{date:val}, 'update_time':iso}}"""
+    out={}
+    for l in locations:
+        try:
+            url=l.get('nws_grid_url')
+            if not url:
+                p=nws(f"{NWS_API_URL}/points/{l['latitude']},{l['longitude']}")
+                url=(p.get('properties') or {}).get('forecastGridData')
+                if not url:continue
+            d=nws(url);props=d.get('properties') or {}
+            update_time=props.get('updateTime')
+            temp_block=(props.get('temperature') or {})
+            pop_block=(props.get('probabilityOfPrecipitation') or {})
+            temp_uom=str(temp_block.get('uom') or '').lower()
+            highs=expand_grid_series(temp_block.get('values'),l['timezone'],'degc' in temp_uom or 'wmounit:degc' in temp_uom,agg='max')
+            pops=expand_grid_series(pop_block.get('values'),l['timezone'],False,agg='max')
+            if highs:
+                out[l['location_key']]={'daily_high_f':highs,'daily_pop_max':pops,'update_time':update_time}
+        except Exception as e:
+            log.warning('NWS gridpoint values unavailable for %s: %s',l['city_name'],e)
+    return out
+
+def save_nws_grid_values(nws_grid,observed,stats):
+    saved=0
+    for k,d in nws_grid.items():
+        l=getloc(k)
+        if not l:continue
+        city=l['city_name']
+        for date,high_f in (d.get('daily_high_f') or {}).items():
+            payload={'value':high_f,'update_time':d.get('update_time'),'location_key':k}
+            fp=h(payload)
+            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'nws_temperature_high\',\'nws_grid\',%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,date,high_f,J(payload),fp,observed,MEASUREMENT_VERSION))
+            saved+=1
+        for date,pop in (d.get('daily_pop_max') or {}).items():
+            payload={'value':pop,'update_time':d.get('update_time'),'location_key':k}
+            fp=h(payload)
+            q('INSERT INTO forecast_observations(observed_at,city,variable,model,forecast_date,scalar_value,payload,payload_hash,source_observed_at,measurement_version) VALUES(NOW(),%s,\'nws_precip_probability_max\',\'nws_grid\',%s,%s,%s,%s,%s,%s) ON CONFLICT(city,variable,model,forecast_date,payload_hash) DO NOTHING',(city,date,pop,J(payload),fp,observed,MEASUREMENT_VERSION))
+            saved+=1
+    stats['nws_grid_values_saved']=stats.get('nws_grid_values_saved',0)+saved
+
+def nws_latest_high(city,date,before):
+    r=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,before,MEASUREMENT_VERSION),one=True)
+    return r[0] if r else None
+
+def nws_confirms_direction(location_key,date,gfs_change,before):
+    """Compare the direction of a GFS-ensemble probability shift against the
+    change in the official NWS gridpoint high-temp forecast over the same
+    lookback window. Returns True/False/None (None = no comparable NWS data
+    this run, e.g. NWS grid unavailable)."""
+    l=getloc(location_key)
+    if not l:return None
+    city=l['city_name']
+    current=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date),one=True)
+    previous=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_temperature_high' AND model='nws_grid' AND forecast_date=%s AND observed_at<%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,before),one=True)
+    if not current or not previous or current[0] is None or previous[0] is None:
+        return None
+    nws_change=current[0]-previous[0]
+    if abs(nws_change)<0.5:
+        return None  # NWS forecast essentially flat this window; not informative either way
+    return (nws_change>0)==(gfs_change>0)
+
 def create_research(l,date,var,m,prevp,curp,preask,eventask,scan,observed,stats):
     ch=curp-prevp
     if abs(ch)<RESEARCH_MIN_FORECAST_CHANGE_POINTS:return
@@ -435,19 +527,11 @@ def process_research(cache,ens,before,scan,observed,stats):
                 prev_payload=prev['payload'] or {}
                 current_run=ens.get(l['location_key'],{}).get('model_run')
                 if kind=='temperature':
-                    current_payload={
-                        'member_highs':d.get('member_highs') or [],
-                        'member_highs_rounded':[round_temp(v) for v in (d.get('member_highs') or [])],
-                        'model_run':current_run,
-                    }
+                    current_payload={'member_highs':d.get('member_highs') or [],'member_highs_rounded':[round_temp(v) for v in (d.get('member_highs') or [])],'model_run':current_run}
                     variable_key='ensemble_temperature_distribution'
                 else:
-                    current_payload={
-                        'member_precip_totals':d.get('member_precip_totals') or [],
-                        'model_run':current_run,
-                    }
+                    current_payload={'member_precip_totals':d.get('member_precip_totals') or [],'model_run':current_run}
                     variable_key='ensemble_rain_distribution'
-
                 current_fp=forecast_revision_fingerprint(variable_key,current_payload)
                 previous_fp=forecast_revision_fingerprint(variable_key,prev_payload)
                 if not current_fp or not previous_fp or current_fp==previous_fp:
@@ -469,9 +553,16 @@ def process_research(cache,ens,before,scan,observed,stats):
                 if pa is not None and ea is not None:
                     create_research(l,date,'temperature' if kind=='temperature' else 'precipitation',m,pp,cp,pa,ea,scan,observed,stats)
 
-def candidate(l,date,m,cp,pp,pm,em,kind='temperature'):
+def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None):
     if cp is None or pp is None or not pm or not em or abs(cp-pp)<MIN_FORECAST_PROBABILITY_CHANGE_POINTS:return None
     if not signal_allowed(l,'rain' if kind=='precipitation' else 'temperature'):return None
+    # NWS confirmation gate: only fire temperature signals when the official
+    # NWS gridpoint forecast (human/station-bias-adjusted) is also moving in
+    # the same direction as the raw GFS ensemble shift. This cuts down on
+    # signals that are just lag/noise in the Open-Meteo mirror rather than a
+    # real forecast change. See fetch_nws_grid_values()/nws_confirms_direction().
+    if kind=='temperature' and REQUIRE_NWS_CONFIRMATION and nws_confirms is False:
+        return None
     best=None
     forecast_change=cp-pp
     sides=('YES',) if forecast_change>0 else ('NO',)
@@ -485,7 +576,7 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature'):
         lag=sch-mc
         edge=sp-ask
         if lag<MIN_MARKET_LAG_POINTS or edge<MIN_PRELIMINARY_EDGE_POINTS:continue
-        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m)}
+        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m),'nws_confirmed':nws_confirms}
         if best is None or (z['market_lag_points'],z['preliminary_edge_points'])>(best['market_lag_points'],best['preliminary_edge_points']):best=z
     return best
 
@@ -505,7 +596,14 @@ def paper(signal,reason,stats):
         market_url=(f"https://kalshi.com/markets/{series_ticker.lower()}/{event_ticker.lower()}" if series_ticker and event_ticker else 'https://kalshi.com/search?q='+requests.utils.quote(market_ticker,safe=''))
     observed_at=signal.get('market_observed_at');observed_text=observed_at.isoformat() if hasattr(observed_at,'isoformat') else str(observed_at or 'unknown')
     def fmt(v): return f'{v:.1f}c' if v is not None else 'n/a'
-    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**CONTRACT: {signal.get('contract_label','Temperature contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — the quote above is the exact market snapshot used by the scanner. The ensemble value is an uncalibrated frequency proxy; verify active Kalshi market rules before any real trade.")
+    nws_line=''
+    if signal.get('nws_confirmed') is True:
+        nws_line='NWS official forecast: **confirms** this move ✅\n'
+    elif signal.get('nws_confirmed') is False:
+        nws_line='NWS official forecast: **does not confirm** this move ⚠️\n'
+    elif signal.get('nws_confirmed') is None:
+        nws_line='NWS official forecast: no comparable data this run\n'
+    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**CONTRACT: {signal.get('contract_label','Temperature contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — the quote above is the exact market snapshot used by the scanner. The ensemble value is an uncalibrated frequency proxy; verify active Kalshi market rules before any real trade.")
     try:
         r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/8.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
         if r is not None and 200<=r.status_code<300:
@@ -597,7 +695,8 @@ def observe(stats,before):
             f'{volume:.0f}' if volume is not None else 'n/a')
 
 def run_scan():
-    scan=None;stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0}
+    stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0,'nws_grid_values_saved':0}
+    scan=None
     started=now();
     try:
         schema();scan=q("INSERT INTO scan_runs(started_at,status,stats,schema_version) VALUES(NOW(),'running','{}'::jsonb,%s) RETURNING id",(SCHEMA_VERSION,),one=True)[0];settle(stats)
@@ -609,7 +708,6 @@ def run_scan():
         ens={}
         observed=now()
 
-        # Deterministic GFS remains NWS-gated because it is supplementary data.
         if ch:
             try:
                 det=fetch_det(list(locs.values()))
@@ -617,8 +715,6 @@ def run_scan():
             except Exception as e:
                 log.warning('Deterministic GFS unavailable: %s',e)
 
-        # Ensemble data is the primary forecast-change signal, so fetch it every scan.
-        # This avoids missing Open-Meteo revisions that do not coincide with an NWS update.
         try:
             stats['ensemble_fetch_attempted']=True
             ens=fetch_ens(list(locs.values()))
@@ -629,11 +725,16 @@ def run_scan():
 
         observed=now()
 
+        # Real NWS gridpoint values, fetched every scan regardless of whether
+        # fetch_ens() succeeded, so the confirmation signal stays up to date.
+        try:
+            nws_grid=fetch_nws_grid_values(list(locs.values()))
+            save_nws_grid_values(nws_grid,observed,stats)
+        except Exception as e:
+            log.warning('NWS gridpoint values unavailable this scan: %s',e)
+
         if ens:
             stats['weather_refreshed']=True
-            # Re-fetch market data after the weather refresh. The event snapshot
-            # must represent the market at/after the forecast change, not a
-            # second copy of the scan-start snapshot.
             event_cache={'temperature':cache(te),'rain':cache(re)}
             snapshot(event_cache,scan,'forecast_event',stats,count_markets=False)
             process_research(event_cache,ens,started,scan,observed,stats)
@@ -659,7 +760,10 @@ def run_scan():
                         pp=tprob(old,m) if kind=='temperature' else rprob(old)
                         pm=prior_market(m.get('ticker',''),started)
                         em=event_market(m.get('ticker',''),scan)
-                        sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation')
+                        nws_confirms=None
+                        if kind=='temperature' and cp is not None and pp is not None:
+                            nws_confirms=nws_confirms_direction(l['location_key'],date,cp-pp,started)
+                        sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation',nws_confirms=nws_confirms)
                         if sig:
                             stats['forecast_shocks']+=1
                             if kind=='rain':
@@ -668,7 +772,6 @@ def run_scan():
 
             save_forecasts(det,ens,observed)
 
-        # Persist the NWS update marker even if an ensemble request failed.
         if ch:
             save_nws(us,locs)
 
