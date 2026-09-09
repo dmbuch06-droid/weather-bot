@@ -181,24 +181,81 @@ def city_title(s):
     return _CITY_ABBREV.get(cand.upper(),cand)
 
 def geocode(city):
-    d=http(GEOCODING_API_URL,{'name':city,'count':5,'language':'en','format':'json','countryCode':'US'})
-    rs=[r for r in d.get('results',[]) if str(r.get('country_code','')).upper()=='US']
+    d=http(GEOCODING_API_URL,{'name':city,'count':5,'language':'en','format':'json'})
+    rs=[r for r in d.get('results',[]) if r.get('latitude') is not None and r.get('longitude') is not None and r.get('timezone')]
     if not rs:return None
-    norm=re.sub(r'[^a-z0-9]','',city.lower());rs.sort(key=lambda r:0 if re.sub(r'[^a-z0-9]','',str(r.get('name','')).lower())==norm else 1);r=rs[0]
-    return r if r.get('latitude') is not None and r.get('longitude') is not None and r.get('timezone') else None
+    norm=re.sub(r'[^a-z0-9]','',city.lower())
+    # Prefer an exact name match, then the largest population among candidates
+    # (disambiguates e.g. "Paris" the metropolis from small same-named towns).
+    rs.sort(key=lambda r:(0 if re.sub(r'[^a-z0-9]','',str(r.get('name','')).lower())==norm else 1,-(r.get('population') or 0)))
+    return rs[0]
+
+# Kalshi's international weather tickers embed the ICAO airport code for the
+# settlement station (e.g. KXHIGHTRJTT -> RJTT = Tokyo Haneda). This is exact
+# and unambiguous, unlike free-text geocoding "Tokyo"/"Dubai"/"Hong Kong" -
+# which either returns no US result (our geocoder was US-only) or the wrong
+# same-named place. Coordinates are airport-level (fine for model queries).
+ICAO_LOCATIONS={
+    'RJTT':('Tokyo',35.5494,139.7798,'Asia/Tokyo'),
+    'ZBAA':('Beijing',40.0801,116.5846,'Asia/Shanghai'),
+    'VHHH':('Hong Kong',22.3080,113.9185,'Asia/Hong_Kong'),
+    'ZSPD':('Shanghai',31.1443,121.8083,'Asia/Shanghai'),
+    'RKSI':('Seoul',37.4602,126.4407,'Asia/Seoul'),
+    'VABB':('Mumbai',19.0896,72.8656,'Asia/Kolkata'),
+    'YSSY':('Sydney',-33.9399,151.1753,'Australia/Sydney'),
+    'CYYZ':('Toronto',43.6777,-79.6248,'America/Toronto'),
+    'EGLL':('London',51.4700,-0.4543,'Europe/London'),
+    'LFPG':('Paris',49.0097,2.5479,'Europe/Paris'),
+    'EDDB':('Berlin',52.3667,13.5033,'Europe/Berlin'),
+    'EDDF':('Frankfurt',50.0379,8.5622,'Europe/Berlin'),
+    'EHAM':('Amsterdam',52.3086,4.7639,'Europe/Amsterdam'),
+    'EBBR':('Brussels',50.9014,4.4844,'Europe/Brussels'),
+    'LSGG':('Geneva',46.2381,6.1089,'Europe/Zurich'),
+    'LTFM':('Istanbul',41.2753,28.7519,'Europe/Istanbul'),
+    'OMDB':('Dubai',25.2532,55.3657,'Asia/Dubai'),
+    'MMMX':('Mexico City',19.4363,-99.0721,'America/Mexico_City'),
+    'SBGR':('Sao Paulo',-23.4356,-46.4731,'America/Sao_Paulo'),
+    'WSSS':('Singapore',1.3644,103.9915,'Asia/Singapore'),
+}
+def icao_loc_for(ticker):
+    x=(ticker or '').upper()
+    for code,(city,lat,lon,tz) in ICAO_LOCATIONS.items():
+        if code in x:
+            k=slug(city)
+            r=getloc(k)
+            if r:return r
+            q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers) VALUES(%s,%s,%s,%s,%s,'icao_lookup',jsonb_build_array(%s)) ON CONFLICT(location_key) DO NOTHING''',(k,city,lat,lon,tz,ticker))
+            return getloc(k)
+    return None
 
 def loc_for(s):
+    # A single bad network call (geocoding timeout, DNS hiccup, etc.) for one
+    # series must never take down the whole scan - every other city's data
+    # would be lost with it. Isolate failures to just this one ticker.
+    try:
+        return _loc_for_inner(s)
+    except Exception as e:
+        log.warning('MAPPING SKIP | ticker=%s | reason=lookup_error | error=%s',s.get('ticker'),e)
+        return None
+
+def _loc_for_inner(s):
     x=(s.get('ticker') or '').upper();mp={'KXHIGHNY':'NYC','HIGHNY':'NYC','KXHIGHCHI':'CHI','HIGHCHI':'CHI','KXHIGHMIA':'MIA','HIGHMIA':'MIA','KXHIGHAUS':'AUS','HIGHAUS':'AUS'}
     for p,k in mp.items():
         if p in x:
             r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
+    icao=icao_loc_for(x)
+    if icao:return icao
     city=city_title(s)
     if not city:
         log.warning('MAPPING SKIP | ticker=%s | reason=no_city_parsed_from_title | title=%r',s.get('ticker'),s.get('title'))
         return None
     r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE lower(city_name)=lower(%s) LIMIT 1',(city,),one=True)
     if r:return rowloc(r)
-    g=geocode(city)
+    try:
+        g=geocode(city)
+    except Exception as e:
+        log.warning('MAPPING SKIP | ticker=%s | reason=geocode_request_failed | parsed_city=%r | error=%s',s.get('ticker'),city,e)
+        return None
     if not g:
         log.warning('MAPPING SKIP | ticker=%s | reason=geocode_no_match | parsed_city=%r',s.get('ticker'),city)
         return None
