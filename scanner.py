@@ -278,7 +278,7 @@ def loc_for(s):
                 break
     if key is None:
         return None
-    r=q('SELECT location_key,city_name,lat,lon,timezone,verified FROM weather_locations WHERE location_key=%s',(key,),one=True)
+    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(key,),one=True)
     return rowloc(r) if r else None
 
 
