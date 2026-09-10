@@ -3,6 +3,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
+
+
+def now(): return datetime.now(timezone.utc)
 import requests
 try:
     import psycopg2
@@ -87,37 +90,9 @@ def loc_for(s):
             if re.search(r'(?<![a-z])'+re.escape(city)+r'(?![a-z])',title):
                 key=aliases[city]; break
     if key is None: return None
-    r=q('SELECT location_key,city_name,lat,lon,timezone,verified FROM weather_locations WHERE location_key=%s',(key,),one=True)
+    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(key,),one=True)
     return rowloc(r) if r else None
 
-def _loc_for_inner(s):
-    x=(s.get('ticker') or '').upper();mp={'KXHIGHNY':'NYC','HIGHNY':'NYC','KXHIGHCHI':'CHI','HIGHCHI':'CHI','KXHIGHMIA':'MIA','HIGHMIA':'MIA','KXHIGHAUS':'AUS','HIGHAUS':'AUS'}
-    for p,k in mp.items():
-        if p in x:
-            r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
-    icao=icao_loc_for(x)
-    if icao:return icao
-    city=city_title(s)
-    if not city:
-        log.warning('MAPPING SKIP | ticker=%s | reason=no_city_parsed_from_title | title=%r',s.get('ticker'),s.get('title'))
-        return None
-    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE lower(city_name)=lower(%s) LIMIT 1',(city,),one=True)
-    if r:return rowloc(r)
-    try:
-        g=geocode(city)
-    except Exception as e:
-        log.warning('MAPPING SKIP | ticker=%s | reason=geocode_request_failed | parsed_city=%r | error=%s',s.get('ticker'),city,e)
-        return None
-    if not g:
-        log.warning('MAPPING SKIP | ticker=%s | reason=geocode_no_match | parsed_city=%r',s.get('ticker'),city)
-        return None
-    feature=str(g.get('feature_code') or '').upper()
-    if not feature.startswith('PPL'):
-        log.warning('MAPPING SKIP | ticker=%s | reason=non_populated_place | parsed_city=%r | geocode_name=%r | feature_code=%s', s.get('ticker'), city, g.get('name'), feature)
-        return None
-    k=slug('_'.join(x for x in [g.get('name'),g.get('admin1'),g.get('country_code')] if x))
-    q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),J(g)))
-    return getloc(k)
 def rowloc(r):
     return {'location_key':r[0],'city_name':r[1],'latitude':r[2],'longitude':r[3],'timezone':r[4],'settlement_verified':bool(r[5]),'signal_enabled':bool(r[6]),'mapping_method':r[7],'nws_grid_url':r[8]}
 def getloc(k):
