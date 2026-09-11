@@ -24,7 +24,7 @@ NWS_API_URL='https://api.weather.gov'
 NWS_USER_AGENT=os.environ.get('NWS_USER_AGENT','WeatherKalshiResearchBot/7.0')
 GEOCODING_API_URL='https://geocoding-api.open-meteo.com/v1/search'
 ENSEMBLE_MODEL='gfs_seamless'; DETERMINISTIC_MODEL='gfs_seamless'
-SCHEMA_VERSION=10; MEASUREMENT_VERSION='v10_incremental_forecast_tracking'
+SCHEMA_VERSION=10; MEASUREMENT_VERSION='v11_contract_aligned_research'
 MIN_FORECAST_PROBABILITY_CHANGE_POINTS=float(os.environ.get('MIN_FORECAST_PROBABILITY_CHANGE_POINTS','20'))
 MIN_MARKET_LAG_POINTS=float(os.environ.get('MIN_MARKET_LAG_POINTS','10'))
 MIN_PRELIMINARY_EDGE_POINTS=float(os.environ.get('MIN_PRELIMINARY_EDGE_POINTS','10'))
@@ -37,21 +37,27 @@ ALLOW_UNVERIFIED_LOCATION_SIGNALS=os.environ.get('ALLOW_UNVERIFIED_LOCATION_SIGN
 ALLOW_RAIN_PAPER_SIGNALS=os.environ.get('ALLOW_RAIN_PAPER_SIGNALS','false').lower() in {'1','true','yes'}
 REQUIRE_NWS_CONFIRMATION=os.environ.get('REQUIRE_NWS_CONFIRMATION','true').lower() in {'1','true','yes'}
 KNOWN={
-    'NYC':('New York City',40.7789,-73.9692,'America/New_York',True),
-    'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',False),
-    'MIA':('Miami',25.7959,-80.2870,'America/New_York',False),
-    'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False),
-    'DC':('Washington',38.9072,-77.0369,'America/New_York',False),
-    'DEN':('Denver',39.7392,-104.9903,'America/Denver',False),
-    'PHIL':('Philadelphia',39.9526,-75.1652,'America/New_York',False),
-    'LAX':('Los Angeles',34.0522,-118.2437,'America/Los_Angeles',False),
-    'SFO':('San Francisco',37.7749,-122.4194,'America/Los_Angeles',False),
-    'SEA':('Seattle',47.6062,-122.3321,'America/Los_Angeles',False),
-    'DAL':('Dallas',32.7767,-96.7970,'America/Chicago',False),
-    'PHX':('Phoenix',33.4484,-112.0740,'America/Phoenix',False),
-    'ATL':('Atlanta',33.7490,-84.3880,'America/New_York',False),
-    'BOS':('Boston',42.3601,-71.0589,'America/New_York',False),
-    'HOU':('Houston',29.7604,-95.3698,'America/Chicago',False),
+    # Coordinates are the actual settlement stations used for the daily-high
+    # city markets, not city-center coordinates.  settlement_verified is
+    # deliberately TRUE only for the four legacy/classic mappings we have
+    # explicitly validated from Kalshi's weather documentation/rules.  The
+    # remaining mappings use the named airport/station coordinates but remain
+    # unverified so the database never claims more certainty than we have.
+    'NYC':('New York City',40.7789,-73.9692,'America/New_York',True,'KNYC','Central Park'),
+    'CHI':('Chicago',41.7868,-87.7522,'America/Chicago',True,'KMDW','Chicago Midway'),
+    'MIA':('Miami',25.7959,-80.2870,'America/New_York',True,'KMIA','Miami International'),
+    'AUS':('Austin',30.1975,-97.6663,'America/Chicago',True,'KAUS','Austin-Bergstrom'),
+    'DC':('Washington',38.8512,-77.0402,'America/New_York',False,'KDCA','Reagan National'),
+    'DEN':('Denver',39.8561,-104.6737,'America/Denver',False,'KDEN','Denver International'),
+    'PHIL':('Philadelphia',39.8744,-75.2424,'America/New_York',False,'KPHL','Philadelphia International'),
+    'LAX':('Los Angeles',33.9425,-118.4081,'America/Los_Angeles',False,'KLAX','Los Angeles International'),
+    'SFO':('San Francisco',37.6213,-122.3790,'America/Los_Angeles',False,'KSFO','San Francisco International'),
+    'SEA':('Seattle',47.4502,-122.3088,'America/Los_Angeles',False,'KSEA','Seattle-Tacoma'),
+    'DAL':('Dallas',32.8998,-97.0403,'America/Chicago',False,'KDFW','Dallas-Fort Worth'),
+    'PHX':('Phoenix',33.4342,-112.0116,'America/Phoenix',False,'KPHX','Phoenix Sky Harbor'),
+    'ATL':('Atlanta',33.6407,-84.4277,'America/New_York',False,'KATL','Hartsfield-Jackson'),
+    'BOS':('Boston',42.3656,-71.0096,'America/New_York',False,'KBOS','Boston Logan'),
+    'HOU':('Houston',29.6454,-95.2789,'America/Chicago',False,'KHOU','Houston Hobby'),
 }
 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('weather-kalshi-scanner'); _DB_CONN=None
@@ -63,6 +69,16 @@ def f(v,d=None):
 def h(x): return hashlib.sha256(json.dumps(x,sort_keys=True,separators=(',',':'),default=str).encode()).hexdigest()
 def slug(s): return re.sub(r'[^A-Z0-9]+','_',s.upper()).strip('_')[:48] or 'UNKNOWN'
 def local_date(ts,tz): return datetime.fromisoformat(str(ts).replace('Z','+00:00')).astimezone(ZoneInfo(tz)).date().isoformat()
+def settlement_date_for_ts(ts,tz):
+    # Kalshi/NWS daily climate reporting uses local standard-time midnight
+    # boundaries. During DST this corresponds to 01:00 through 00:59 local
+    # clock time the following day. This prevents the 00:00-00:59 DST hour
+    # from being assigned to the wrong Kalshi settlement date.
+    dt=datetime.fromisoformat(str(ts).replace('Z','+00:00')).astimezone(ZoneInfo(tz))
+    if dt.dst() and dt.dst().total_seconds()!=0 and dt.hour==0:
+        from datetime import timedelta
+        return (dt.date()-timedelta(days=1)).isoformat()
+    return dt.date().isoformat()
 def round_temp(v):
     v=f(v)
     if v is None:return None
@@ -149,11 +165,34 @@ def schema():
         'ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS measurement_version TEXT',
         'ALTER TABLE alert_log ADD COLUMN IF NOT EXISTS measurement_version TEXT',
         'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS source_observed_at TIMESTAMPTZ',
-        'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS measurement_version TEXT']:
+        'ALTER TABLE forecast_observations ADD COLUMN IF NOT EXISTS measurement_version TEXT',
+        'ALTER TABLE weather_locations ADD COLUMN IF NOT EXISTS settlement_station TEXT',
+        'ALTER TABLE weather_locations ADD COLUMN IF NOT EXISTS settlement_station_name TEXT',
+        'ALTER TABLE weather_locations ADD COLUMN IF NOT EXISTS settlement_source TEXT']:
         q(s)
     for s in ['CREATE INDEX IF NOT EXISTS idx_forecast_lookup ON forecast_observations(city,variable,model,forecast_date,observed_at DESC)','CREATE INDEX IF NOT EXISTS idx_market_lookup ON market_snapshots(ticker,observed_at DESC)','CREATE INDEX IF NOT EXISTS idx_market_scan ON market_snapshots(scan_id,snapshot_phase,observed_at DESC)','CREATE INDEX IF NOT EXISTS idx_research_open ON forecast_research_events(status,created_at DESC)','CREATE INDEX IF NOT EXISTS idx_updates_event ON forecast_research_updates(event_id,observed_at DESC)']:q(s)
-    for k,(city,lat,lon,tz,verified) in KNOWN.items():
-        q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method) VALUES(%s,%s,%s,%s,%s,%s,%s,'manual_existing') ON CONFLICT(location_key) DO NOTHING''',(k,city,lat,lon,tz,verified,verified))
+    for k,(city,lat,lon,tz,verified,station,station_name) in KNOWN.items():
+        # KNOWN is authoritative.  Do NOT use DO NOTHING here: that allowed
+        # stale city-center coordinates to survive forever after a mapping fix.
+        q('''INSERT INTO weather_locations(
+                location_key,city_name,latitude,longitude,timezone,
+                settlement_verified,signal_enabled,mapping_method,
+                settlement_station,settlement_station_name,settlement_source,
+                updated_at
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,'manual_settlement_station',%s,%s,'kalshi_daily_temperature',NOW())
+            ON CONFLICT(location_key) DO UPDATE SET
+                city_name=EXCLUDED.city_name,
+                latitude=EXCLUDED.latitude,
+                longitude=EXCLUDED.longitude,
+                timezone=EXCLUDED.timezone,
+                settlement_verified=EXCLUDED.settlement_verified,
+                signal_enabled=EXCLUDED.signal_enabled,
+                mapping_method=EXCLUDED.mapping_method,
+                settlement_station=EXCLUDED.settlement_station,
+                settlement_station_name=EXCLUDED.settlement_station_name,
+                settlement_source=EXCLUDED.settlement_source,
+                updated_at=NOW()
+        ''',(k,city,lat,lon,tz,verified,verified,station,station_name))
 
 def series_list():
     out=[];cur=None
@@ -252,49 +291,60 @@ def icao_loc_for(ticker):
     return None
 
 def loc_for(s):
-    """Allow only the fixed 15 major U.S. cities; never dynamically geocode others."""
+    """Map a Kalshi daily-weather series only to the authoritative 15-city
+    settlement-station table. Never fall back to city-center geocoding for a
+    paper-trading signal."""
     x=(s.get('ticker') or '').upper()
     title=(s.get('title') or s.get('subtitle') or '').strip().lower()
     ticker_map={
-        'KXHIGHNY':'NYC','HIGHNY':'NYC','KXHIGHCHI':'CHI','HIGHCHI':'CHI',
-        'KXHIGHMIA':'MIA','HIGHMIA':'MIA','KXHIGHAUS':'AUS','HIGHAUS':'AUS',
+        'KXHIGHNY':'NYC','HIGHNY':'NYC',
+        'KXHIGHCHI':'CHI','HIGHCHI':'CHI',
+        'KXHIGHMIA':'MIA','HIGHMIA':'MIA',
+        'KXHIGHAUS':'AUS','HIGHAUS':'AUS',
         'KXHIGHTDC':'DC','KXHIGHDC':'DC','HIGHTDC':'DC','HIGHDC':'DC',
-        'KXHIGHDEN':'DEN','HIGHDEN':'DEN','KXHIGHPHIL':'PHIL','HIGHPHIL':'PHIL',
-        'KXHIGHLAX':'LAX','HIGHLAX':'LAX','KXHIGHTSFO':'SFO','HIGHTSFO':'SFO',
-        'KXHIGHSEA':'SEA','HIGHSEA':'SEA','KXHIGHDAL':'DAL','HIGHDAL':'DAL',
-        'KXHIGHPHX':'PHX','HIGHPHX':'PHX','KXHIGHATL':'ATL','HIGHATL':'ATL',
-        'KXHIGHBOS':'BOS','HIGHBOS':'BOS','KXHIGHHOU':'HOU','HIGHHOU':'HOU'}
+        'KXHIGHDEN':'DEN','HIGHDEN':'DEN',
+        'KXHIGHPHIL':'PHIL','HIGHPHIL':'PHIL',
+        'KXHIGHLAX':'LAX','HIGHLAX':'LAX',
+        'KXHIGHTSFO':'SFO','HIGHTSFO':'SFO',
+        'KXHIGHSEA':'SEA','HIGHSEA':'SEA',
+        'KXHIGHDAL':'DAL','HIGHDAL':'DAL',
+        'KXHIGHPHX':'PHX','HIGHPHX':'PHX',
+        'KXHIGHATL':'ATL','HIGHATL':'ATL',
+        'KXHIGHTBOS':'BOS','KXHIGHBOS':'BOS','HIGHBOS':'BOS',
+        'KXHIGHTHOU':'HOU','KXHIGHHOU':'HOU','HIGHTHOU':'HOU','HIGHHOU':'HOU'
+    }
     aliases={
         'new york city':'NYC','new york':'NYC','chicago':'CHI','miami':'MIA',
         'austin':'AUS','washington dc':'DC','washington, dc':'DC','washington':'DC',
-        'denver':'DEN','philadelphia':'PHIL','los angeles':'LAX',
+        'denver':'DEN','philadelphia':'PHIL','los angeles':'LAX','la':'LAX',
         'san francisco':'SFO','seattle':'SEA','dallas':'DAL','phoenix':'PHX',
-        'atlanta':'ATL','boston':'BOS','houston':'HOU'}
+        'atlanta':'ATL','boston':'BOS','houston':'HOU'
+    }
     key=next((k for p,k in ticker_map.items() if x.startswith(p)),None)
     if key is None:
         for city in sorted(aliases,key=len,reverse=True):
             if re.search(r'(?<![a-z])'+re.escape(city)+r'(?![a-z])',title):
-                key=aliases[city]
-                break
+                key=aliases[city]; break
     if key is None:
         return None
-    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(key,),one=True)
+    r=q('''SELECT location_key,city_name,latitude,longitude,timezone,
+                  settlement_verified,signal_enabled,mapping_method,nws_grid_url,
+                  settlement_station,settlement_station_name,settlement_source
+           FROM weather_locations WHERE location_key=%s''',(key,),one=True)
     return rowloc(r) if r else None
-
-
 
 def _loc_for_inner(s):
     x=(s.get('ticker') or '').upper();mp={'KXHIGHNY':'NYC','HIGHNY':'NYC','KXHIGHCHI':'CHI','HIGHCHI':'CHI','KXHIGHMIA':'MIA','HIGHMIA':'MIA','KXHIGHAUS':'AUS','HIGHAUS':'AUS'}
     for p,k in mp.items():
         if p in x:
-            r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
+            r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url,settlement_station,settlement_station_name,settlement_source FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
     icao=icao_loc_for(x)
     if icao:return icao
     city=city_title(s)
     if not city:
         log.warning('MAPPING SKIP | ticker=%s | reason=no_city_parsed_from_title | title=%r',s.get('ticker'),s.get('title'))
         return None
-    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE lower(city_name)=lower(%s) LIMIT 1',(city,),one=True)
+    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url,settlement_station,settlement_station_name,settlement_source FROM weather_locations WHERE lower(city_name)=lower(%s) LIMIT 1',(city,),one=True)
     if r:return rowloc(r)
     try:
         g=geocode(city)
@@ -312,9 +362,15 @@ def _loc_for_inner(s):
     q('''INSERT INTO weather_locations(location_key,city_name,latitude,longitude,timezone,mapping_method,source_series_tickers,raw_geocode) VALUES(%s,%s,%s,%s,%s,'open_meteo_geocoding',jsonb_build_array(%s),%s) ON CONFLICT(location_key) DO NOTHING''',(k,g['name'],g['latitude'],g['longitude'],g['timezone'],s.get('ticker',''),J(g)))
     return getloc(k)
 def rowloc(r):
-    return {'location_key':r[0],'city_name':r[1],'latitude':r[2],'longitude':r[3],'timezone':r[4],'settlement_verified':bool(r[5]),'signal_enabled':bool(r[6]),'mapping_method':r[7],'nws_grid_url':r[8]}
+    return {
+        'location_key':r[0],'city_name':r[1],'latitude':r[2],'longitude':r[3],
+        'timezone':r[4],'settlement_verified':bool(r[5]),'signal_enabled':bool(r[6]),
+        'mapping_method':r[7],'nws_grid_url':r[8],
+        'settlement_station':r[9],'settlement_station_name':r[10],
+        'settlement_source':r[11]
+    }
 def getloc(k):
-    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
+    r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url,settlement_station,settlement_station_name,settlement_source FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
 
 def discover(xs):
     temps=[];rains=[];seen_t=set();seen_r=set();skipped_temp=0;skipped_rain=0
@@ -588,7 +644,7 @@ def norm(data,locs):
 def hourly(loc,d):
     x=d.get('hourly') or {};ts=x.get('time') or [];temps=x.get('temperature_2m') or [];rain=x.get('precipitation') or [];g=defaultdict(lambda:{'t':[],'p':[]})
     for i,t in enumerate(ts):
-        day=local_date(t,loc['timezone']);
+        day=settlement_date_for_ts(t,loc['timezone']);
         if i<len(temps) and f(temps[i]) is not None:g[day]['t'].append(f(temps[i]))
         if i<len(rain) and f(rain[i]) is not None:g[day]['p'].append(f(rain[i]))
     return {day:{'high':max(v['t']),'precipitation_sum':sum(v['p'])} for day,v in g.items() if v['t']}
@@ -606,7 +662,7 @@ def fetch_ens(locs):
         x=d.get('hourly') or {};ts=x.get('time') or [];tk=sorted(k for k in x if k.startswith('temperature_2m_member'));pk=sorted(k for k in x if k.startswith('precipitation_member'));days=defaultdict(lambda:{'t':defaultdict(list),'p':defaultdict(float)})
         if len(tk)<MIN_ENSEMBLE_MEMBERS:raise RuntimeError(f'Only {len(tk)} ensemble temperature members for {l["city_name"]}; expected at least {MIN_ENSEMBLE_MEMBERS}')
         for i,t in enumerate(ts):
-            day=local_date(t,l['timezone'])
+            day=settlement_date_for_ts(t,l['timezone'])
             for k in tk:
                 a=x.get(k) or []
                 if i<len(a) and f(a[i]) is not None:days[day]['t'][k].append(f(a[i]))
@@ -654,7 +710,7 @@ def expand_grid_series(values,tz,unit_is_celsius,agg='max'):
         v=val*9/5+32 if unit_is_celsius else val
         for hstep in range(0,total_hours,1):
             t=start+timedelta(hours=hstep)
-            try:day=local_date(t.isoformat(),tz)
+            try:day=settlement_date_for_ts(t.isoformat(),tz)
             except Exception:continue
             by_day[day].append(v)
     out={}
@@ -746,7 +802,7 @@ def process_research(cache,ens,before,scan,observed,stats):
             for m in ms:
                 stats['research_markets_considered']+=1
                 date=date_market(m)
-                if not date:continue
+                if not date or not contract_is_aligned(l,m,date,'temperature' if kind=='temperature' else 'precipitation'):continue
                 d=ens.get(l['location_key'],{}).get('daily',{}).get(date)
                 if not d:continue
                 curvals=d.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
@@ -800,7 +856,27 @@ def process_research(cache,ens,before,scan,observed,stats):
                 if pa is not None and ea is not None:
                     create_research(l,date,'temperature' if kind=='temperature' else 'precipitation',m,pp,cp,pa,ea,scan,observed,stats)
 
+def contract_is_aligned(l,m,date,kind):
+    """Fail closed unless the market is a daily high/precip contract for
+    the exact mapped settlement location and has an explicit date."""
+    if not l or not date or not m.get('ticker'):
+        return False
+    if not l.get('settlement_station'):
+        return False
+    st=(m.get('strike_type') or '').lower()
+    if kind=='temperature' and st not in {'between','greater','less'}:
+        return False
+    if kind=='precipitation' and st not in {'between','greater','less'}:
+        return False
+    # Only daily-high contracts are handled by this scanner. Hourly contracts
+    # must never be silently interpreted as a daily maximum.
+    title=(m.get('title') or '').lower()
+    if 'hourly' in title or ' at ' in title:
+        return False
+    return True
+
 def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None):
+    if not contract_is_aligned(l,m,date,kind):return None
     if cp is None or pp is None or not pm or not em or abs(cp-pp)<MIN_FORECAST_PROBABILITY_CHANGE_POINTS:return None
     if not signal_allowed(l,'rain' if kind=='precipitation' else 'temperature'):return None
     # NWS confirmation gate: only fire temperature signals when the official
@@ -823,7 +899,7 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None):
         lag=sch-mc
         edge=sp-ask
         if lag<MIN_MARKET_LAG_POINTS or edge<MIN_PRELIMINARY_EDGE_POINTS:continue
-        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m),'nws_confirmed':nws_confirms}
+        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m),'nws_confirmed':nws_confirms,'settlement_station':l.get('settlement_station'),'settlement_station_name':l.get('settlement_station_name'),'settlement_source':l.get('settlement_source')}
         if best is None or (z['market_lag_points'],z['preliminary_edge_points'])>(best['market_lag_points'],best['preliminary_edge_points']):best=z
     return best
 
@@ -850,7 +926,7 @@ def paper(signal,reason,stats):
         nws_line='NWS official forecast: **does not confirm** this move ⚠️\n'
     elif signal.get('nws_confirmed') is None:
         nws_line='NWS official forecast: no comparable data this run\n'
-    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**CONTRACT: {signal.get('contract_label','Temperature contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — the quote above is the exact market snapshot used by the scanner. The ensemble value is an uncalibrated frequency proxy; verify active Kalshi market rules before any real trade.")
+    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**SETTLEMENT STATION: {signal.get('settlement_station_name','unknown')} ({signal.get('settlement_station','?')})**\n**CONTRACT: {signal.get('contract_label','Temperature contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nEnsemble probability proxy: **{signal['model_probability_proxy']:.1f}%**\n💰 **Model fair value / max entry before fees: {signal['max_profitable_entry_cents']:.1f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — the quote above is the exact market snapshot used by the scanner. The ensemble value is an uncalibrated frequency proxy; verify active Kalshi market rules before any real trade.")
     try:
         r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/8.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
         if r is not None and 200<=r.status_code<300:
@@ -1057,7 +1133,7 @@ def run_scan():
                             stats['forecast_shocks']+=1
                             if kind=='rain':
                                 stats['rain_forecast_shocks']+=1
-                            paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url'),'market_observed_at':sig.get('market_observed_at'),'yes_bid_cents':sig.get('yes_bid_cents'),'yes_ask_cents':sig.get('yes_ask_cents'),'no_bid_cents':sig.get('no_bid_cents'),'no_ask_cents':sig.get('no_ask_cents'),'last_price_cents':sig.get('last_price_cents'),'spread_yes_cents':sig.get('spread_yes_cents'),'spread_no_cents':sig.get('spread_no_cents'),'volume':sig.get('volume'),'open_interest':sig.get('open_interest')},stats)
+                            paper(sig,{'measurement_version':MEASUREMENT_VERSION,'settlement_verified':l['settlement_verified'],'signal_enabled':l['signal_enabled'],'settlement_station':l.get('settlement_station'),'settlement_station_name':l.get('settlement_station_name'),'settlement_source':l.get('settlement_source'),'ensemble_model':ENSEMBLE_MODEL,'event_ticker':m.get('event_ticker'),'series_ticker':m.get('series_ticker') or s.get('ticker'),'market_url':m.get('url'),'market_observed_at':sig.get('market_observed_at'),'yes_bid_cents':sig.get('yes_bid_cents'),'yes_ask_cents':sig.get('yes_ask_cents'),'no_bid_cents':sig.get('no_bid_cents'),'no_ask_cents':sig.get('no_ask_cents'),'last_price_cents':sig.get('last_price_cents'),'spread_yes_cents':sig.get('spread_yes_cents'),'spread_no_cents':sig.get('spread_no_cents'),'volume':sig.get('volume'),'open_interest':sig.get('open_interest')},stats)
 
             t=phase('candidate_loop',t)
             save_forecasts(det,ens,observed)
