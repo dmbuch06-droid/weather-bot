@@ -407,11 +407,26 @@ def markets(ticker):
         d=http(KALSHI_API_URL+'/markets',p);out+=d.get('markets',[]);cur=d.get('cursor')
         if not cur:return out
 
+def _ticker_date_parts(value):
+    out=[]
+    for p in str(value or '').split('-'):
+        try:
+            out.append(datetime.strptime(p,'%y%b%d').date().isoformat())
+        except:
+            pass
+    return out
+
+def ticker_dates(m):
+    """Return all explicit YYMonDD dates embedded in event/market tickers."""
+    dates=[]
+    for value in (m.get('event_ticker',''),m.get('ticker','')):
+        dates.extend(_ticker_date_parts(value))
+    return dates
+
 def date_market(m):
-    for s in (m.get('event_ticker',''),m.get('ticker','')):
-        for p in s.split('-'):
-            try:return datetime.strptime(p,'%y%b%d').date().isoformat()
-            except:pass
+    dates=ticker_dates(m)
+    if dates:
+        return dates[0]
     log.warning('MAPPING SKIP | ticker=%s | event_ticker=%s | reason=unparseable_date_in_ticker',m.get('ticker'),m.get('event_ticker'))
     return None
 
@@ -861,7 +876,20 @@ def contract_is_aligned(l,m,date,kind):
     the exact mapped settlement location and has an explicit date."""
     if not l or not date or not m.get('ticker'):
         return False
-    if not l.get('settlement_station'):
+    # Paper signals must have an explicit settlement station AND source.
+    # This prevents a geocoded/model location from being treated as the
+    # authoritative Kalshi settlement location.
+    if not l.get('settlement_station') or not l.get('settlement_source'):
+        return False
+    # The forecast date used for the probability calculation must be the same
+    # date encoded by the Kalshi event/market ticker.  date_market() is parsed
+    # from those tickers; reject anything that cannot be independently aligned.
+    ticker_dates_found=ticker_dates(m)
+    if not ticker_dates_found or any(d != date for d in ticker_dates_found) or len(set(ticker_dates_found)) != 1:
+        log.warning(
+            'SIGNAL SKIP | ticker=%s | event_ticker=%s | forecast_date=%s | ticker_dates=%s | reason=date_mismatch',
+            m.get('ticker'), m.get('event_ticker'), date, ticker_dates_found
+        )
         return False
     st=(m.get('strike_type') or '').lower()
     if kind=='temperature' and st not in {'between','greater','less'}:
@@ -884,7 +912,10 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None):
     # the same direction as the raw GFS ensemble shift. This cuts down on
     # signals that are just lag/noise in the Open-Meteo mirror rather than a
     # real forecast change. See fetch_nws_grid_values()/nws_confirms_direction().
-    if kind=='temperature' and REQUIRE_NWS_CONFIRMATION and nws_confirms is False:
+    # Fail closed.  When NWS confirmation is required, ONLY an explicit
+    # True confirmation may produce a temperature paper signal.  False means
+    # NWS disagrees; None means we do not have comparable official data.
+    if kind=='temperature' and REQUIRE_NWS_CONFIRMATION and nws_confirms is not True:
         return None
     best=None
     forecast_change=cp-pp
@@ -900,10 +931,87 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None):
         edge=sp-ask
         if lag<MIN_MARKET_LAG_POINTS or edge<MIN_PRELIMINARY_EDGE_POINTS:continue
         z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':sp,'preliminary_edge_points':edge,'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':pp,'forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m),'nws_confirmed':nws_confirms,'settlement_station':l.get('settlement_station'),'settlement_station_name':l.get('settlement_station_name'),'settlement_source':l.get('settlement_source')}
+        valid,why=validate_signal_invariant(z)
+        if not valid:
+            log.error(
+                'CANDIDATE REJECTED | ticker=%s | side=%s | cp=%.3f | pp=%.3f | reason=%s',
+                z.get('market_ticker'), z.get('side'), cp, pp, why
+            )
+            continue
         if best is None or (z['market_lag_points'],z['preliminary_edge_points'])>(best['market_lag_points'],best['preliminary_edge_points']):best=z
     return best
 
+def validate_signal_invariant(signal):
+    """Recompute the trade side, side probability, entry ask and edge.
+
+    This is a hard safety boundary between candidate generation and paper
+    trading/Discord.  A regression that accidentally passes raw YES
+    probability while recommending BUY NO must be rejected rather than
+    logged or paper-traded.
+    """
+    try:
+        side=str(signal.get('side') or '').upper()
+        cp=f(signal.get('forecast_current_probability'))
+        pp=f(signal.get('forecast_previous_probability'))
+        entry=f(signal.get('entry_price_cents'))
+        model=f(signal.get('model_probability_proxy'))
+        max_entry=f(signal.get('max_profitable_entry_cents'))
+        edge=f(signal.get('preliminary_edge_points'))
+        fchg=f(signal.get('forecast_probability_change_points'))
+        yask=f(signal.get('yes_ask_cents'))
+        nask=f(signal.get('no_ask_cents'))
+
+        if any(v is None for v in (cp,pp,entry,model,max_entry,edge,fchg)):
+            return False, 'missing_signal_fields'
+
+        expected_side='YES' if cp-pp>0 else 'NO' if cp-pp<0 else None
+        if expected_side is None or side != expected_side:
+            return False, f'side_mismatch expected={expected_side} actual={side}'
+
+        expected_prob=cp if side=='YES' else 100.0-cp
+        expected_ask=yask if side=='YES' else nask
+        if expected_ask is None:
+            return False, f'missing_{side.lower()}_ask'
+
+        expected_edge=expected_prob-expected_ask
+
+        # Tight numerical tolerance only for floating-point representation.
+        checks=(
+            ('model_probability_proxy',model,expected_prob),
+            ('max_profitable_entry_cents',max_entry,expected_prob),
+            ('entry_price_cents',entry,expected_ask),
+            ('preliminary_edge_points',edge,expected_edge),
+            ('forecast_probability_change_points',abs(cp-pp),fchg),
+        )
+        for name,actual,want in checks:
+            if abs(actual-want)>0.001:
+                return False, f'{name}_mismatch actual={actual:.6f} expected={want:.6f}'
+
+        # Keep the displayed/action-side probability bounded to a real
+        # probability and the entry price inside the configured paper range.
+        if not 0.0 <= expected_prob <= 100.0:
+            return False, 'side_probability_out_of_range'
+        if not MIN_ENTRY_PRICE_CENTS <= expected_ask <= MAX_ENTRY_PRICE_CENTS:
+            return False, 'entry_price_out_of_configured_range'
+
+        return True, 'ok'
+    except Exception as e:
+        return False, f'invariant_exception={e}'
+
 def paper(signal,reason,stats):
+    valid,why=validate_signal_invariant(signal)
+    if not valid:
+        stats['signals_rejected_invariant']=stats.get('signals_rejected_invariant',0)+1
+        log.error(
+            'SIGNAL REJECTED | ticker=%s | side=%s | cp=%s | pp=%s | entry=%s | model=%s | edge=%s | reason=%s',
+            signal.get('market_ticker'), signal.get('side'),
+            signal.get('forecast_current_probability'),
+            signal.get('forecast_previous_probability'),
+            signal.get('entry_price_cents'),
+            signal.get('model_probability_proxy'),
+            signal.get('preliminary_edge_points'), why
+        )
+        return
     fp=h({'city':signal['city'],'forecast_date':signal['forecast_date'],'market_ticker':signal['market_ticker'],'side':signal['side'],'previous_probability':round(signal['forecast_previous_probability'],6),'current_probability':round(signal['forecast_current_probability'],6)})
     existing=q('SELECT id FROM paper_trades WHERE signal_fingerprint=%s',(fp,),one=True)
     if not existing:
@@ -1018,7 +1126,7 @@ def observe(stats,before):
             f'{volume:.0f}' if volume is not None else 'n/a')
 
 def run_scan():
-    stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0,'nws_grid_values_saved':0,'phase_seconds':{}}
+    stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'signals_rejected_invariant':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0,'nws_grid_values_saved':0,'phase_seconds':{}}
     scan=None
     started=now();
     def phase(name,t0):
