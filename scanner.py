@@ -1,4 +1,4 @@
-import hashlib, json, logging, os, re, statistics, time
+import hashlib, json, logging, math, os, re, statistics, time
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -24,7 +24,7 @@ NWS_API_URL='https://api.weather.gov'
 NWS_USER_AGENT=os.environ.get('NWS_USER_AGENT','WeatherKalshiResearchBot/7.0')
 GEOCODING_API_URL='https://geocoding-api.open-meteo.com/v1/search'
 ENSEMBLE_MODEL='gfs_seamless'; DETERMINISTIC_MODEL='gfs_seamless'
-SCHEMA_VERSION=11; MEASUREMENT_VERSION='v12_validated_signal_engine'
+SCHEMA_VERSION=12; MEASUREMENT_VERSION='v13_precipitation_only_validated'
 MIN_FORECAST_PROBABILITY_CHANGE_POINTS=float(os.environ.get('MIN_FORECAST_PROBABILITY_CHANGE_POINTS','20'))
 MIN_MARKET_LAG_POINTS=float(os.environ.get('MIN_MARKET_LAG_POINTS','10'))
 MIN_ENTRY_PRICE_CENTS=float(os.environ.get('MIN_ENTRY_PRICE_CENTS','5'))
@@ -32,34 +32,29 @@ MAX_ENTRY_PRICE_CENTS=float(os.environ.get('MAX_ENTRY_PRICE_CENTS','95'))
 PAPER_RISK_DOLLARS=float(os.environ.get('PAPER_RISK_DOLLARS','10'))
 RESEARCH_MIN_FORECAST_CHANGE_POINTS=float(os.environ.get('RESEARCH_MIN_FORECAST_CHANGE_POINTS','3'))
 MIN_ENSEMBLE_MEMBERS=int(os.environ.get('MIN_ENSEMBLE_MEMBERS','20'))
+MIN_PRECIP_ENSEMBLE_MEMBERS=int(os.environ.get('MIN_PRECIP_ENSEMBLE_MEMBERS','20'))
 MIN_CALIBRATION_SAMPLES=int(os.environ.get('MIN_CALIBRATION_SAMPLES','200'))
 ENSEMBLE_DISPERSION_INFLATION=float(os.environ.get('ENSEMBLE_DISPERSION_INFLATION','1.25'))
 MIN_MODEL_EDGE_AFTER_FEES=float(os.environ.get('MIN_MODEL_EDGE_AFTER_FEES','7'))
-ALLOW_RAIN_PAPER_SIGNALS=os.environ.get('ALLOW_RAIN_PAPER_SIGNALS','false').lower() in {'1','true','yes'}
+ALLOW_RAIN_PAPER_SIGNALS=True
+MIN_RAIN_NWS_POP_CONFIRMATION_POINTS=float(os.environ.get('MIN_RAIN_NWS_POP_CONFIRMATION_POINTS','5'))
 REQUIRE_NWS_CONFIRMATION=os.environ.get('REQUIRE_NWS_CONFIRMATION','true').lower() in {'1','true','yes'}
 KNOWN={
-    # Coordinates are the actual settlement stations used for the daily-high
-    # city markets, not city-center coordinates.  settlement_verified is
-    # deliberately TRUE only for the four legacy/classic mappings we have
-    # explicitly validated from Kalshi's weather documentation/rules.  The
-    # remaining mappings use the named airport/station coordinates but remain
-    # unverified so the database never claims more certainty than we have.
-    'NYC':('New York City',40.7789,-73.9692,'America/New_York',False,'KNYC','Central Park'),
-    'CHI':('Chicago',41.7868,-87.7522,'America/Chicago',False,'KMDW','Chicago Midway'),
-    'MIA':('Miami',25.7959,-80.2870,'America/New_York',False,'KMIA','Miami International'),
-    'AUS':('Austin',30.1975,-97.6663,'America/Chicago',False,'KAUS','Austin-Bergstrom'),
-    'DC':('Washington',38.8512,-77.0402,'America/New_York',False,'KDCA','Reagan National'),
-    'DEN':('Denver',39.8561,-104.6737,'America/Denver',False,'KDEN','Denver International'),
-    'PHIL':('Philadelphia',39.8744,-75.2424,'America/New_York',False,'KPHL','Philadelphia International'),
-    'LAX':('Los Angeles',33.9425,-118.4081,'America/Los_Angeles',False,'KLAX','Los Angeles International'),
-    'SFO':('San Francisco',37.6213,-122.3790,'America/Los_Angeles',False,'KSFO','San Francisco International'),
-    'SEA':('Seattle',47.4502,-122.3088,'America/Los_Angeles',False,'KSEA','Seattle-Tacoma'),
-    'DAL':('Dallas',32.8998,-97.0403,'America/Chicago',False,'KDFW','Dallas-Fort Worth'),
-    'PHX':('Phoenix',33.4342,-112.0116,'America/Phoenix',False,'KPHX','Phoenix Sky Harbor'),
-    'ATL':('Atlanta',33.6407,-84.4277,'America/New_York',False,'KATL','Hartsfield-Jackson'),
-    'BOS':('Boston',42.3656,-71.0096,'America/New_York',False,'KBOS','Boston Logan'),
-    'HOU':('Houston',29.6454,-95.2789,'America/Chicago',False,'KHOU','Houston Hobby'),
+    # First production research cohort: precipitation only, ten cities with
+    # explicit Kalshi rain settlement stations and Weather Company settlement.
+    # Coordinates are the mapped climate-report stations used by the rain rules.
+    'NYC':('New York City',40.7789,-73.9692,'America/New_York',True,'CLINYC','New York City (CLINYC)'),
+    'CHI':('Chicago',41.9742,-87.9073,'America/Chicago',True,'CLIORD','Chicago (CLIORD)'),
+    'MIA':('Miami',25.7959,-80.2870,'America/New_York',True,'CLIMIA','Miami (CLIMIA)'),
+    'LAX':('Los Angeles',33.9425,-118.4081,'America/Los_Angeles',True,'CLILAX','Los Angeles (CLILAX)'),
+    'DEN':('Denver',39.8561,-104.6737,'America/Denver',True,'CLIDEN','Denver (CLIDEN)'),
+    'PHIL':('Philadelphia',39.8744,-75.2424,'America/New_York',True,'CLIPHL','Philadelphia (CLIPHL)'),
+    'DC':('Washington DC',38.8512,-77.0402,'America/New_York',True,'CLIDCA','Washington DC (CLIDCA)'),
+    'BOS':('Boston',42.3656,-71.0096,'America/New_York',True,'CLIBOS','Boston (CLIBOS)'),
+    'DAL':('Dallas',32.8998,-97.0403,'America/Chicago',True,'CLIDFW','Dallas/Fort Worth (CLIDFW)'),
+    'HOU':('Houston',29.6454,-95.2789,'America/Chicago',True,'CLIHOU','Houston (CLIHOU)'),
 }
+
 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('weather-kalshi-scanner'); _DB_CONN=None
 
@@ -182,7 +177,7 @@ def schema():
                 settlement_verified,signal_enabled,mapping_method,
                 settlement_station,settlement_station_name,settlement_source,
                 updated_at
-            ) VALUES(%s,%s,%s,%s,%s,%s,%s,'manual_settlement_station',%s,%s,'kalshi_daily_temperature',NOW())
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,'manual_settlement_station',%s,%s,'weather_company_precipitation',NOW())
             ON CONFLICT(location_key) DO UPDATE SET
                 city_name=EXCLUDED.city_name,
                 latitude=EXCLUDED.latitude,
@@ -294,12 +289,14 @@ def icao_loc_for(ticker):
     return None
 
 def loc_for(s):
-    """Map a Kalshi daily-weather series only to the authoritative 15-city
-    settlement-station table. Never fall back to city-center geocoding for a
-    paper-trading signal."""
+    """Map a Kalshi daily-weather series to the authoritative settlement
+    table. Rain series are handled from their market tickers because KXRAIN
+    is a multi-city event family rather than a single-city series."""
     x=(s.get('ticker') or '').upper()
     title=(s.get('title') or s.get('subtitle') or '').strip().lower()
     ticker_map={
+        # Rain series are multi-city events; the city is in the market ticker suffix.
+        'KXRAIN-':'__RAIN_EVENT__',
         'KXHIGHNY':'NYC','HIGHNY':'NYC',
         'KXHIGHCHI':'CHI','HIGHCHI':'CHI',
         'KXHIGHMIA':'MIA','HIGHMIA':'MIA',
@@ -324,6 +321,12 @@ def loc_for(s):
         'atlanta':'ATL','boston':'BOS','houston':'HOU'
     }
     key=next((k for p,k in ticker_map.items() if x.startswith(p)),None)
+    if key=='__RAIN_EVENT__':
+        suffix=x.rsplit('-',1)[-1]
+        rain_suffix={'NYC':'NYC','CHI':'CHI','MIA':'MIA','LAX':'LAX','DEN':'DEN','PHIL':'PHIL','DC':'DC','BOS':'BOS','DAL':'DAL','HOU':'HOU'}
+        key=rain_suffix.get(suffix)
+        if key is None:
+            return None
     if key is None:
         for city in sorted(aliases,key=len,reverse=True):
             if re.search(r'(?<![a-z])'+re.escape(city)+r'(?![a-z])',title):
@@ -376,31 +379,62 @@ def getloc(k):
     r=q('SELECT location_key,city_name,latitude,longitude,timezone,settlement_verified,signal_enabled,mapping_method,nws_grid_url,settlement_station,settlement_station_name,settlement_source FROM weather_locations WHERE location_key=%s',(k,),one=True);return rowloc(r) if r else None
 
 def discover(xs):
-    temps=[];rains=[];seen_t=set();seen_r=set();skipped_temp=0;skipped_rain=0
+    temps=[];rain_series=[];skipped_temp=0;skipped_rain=0
     for s in xs:
         if is_temp(s):
             l=loc_for(s)
             if l:temps.append((s,l))
             else:skipped_temp+=1
         elif is_rain(s):
-            l=loc_for(s)
-            if l:rains.append((s,l))
-            else:skipped_rain+=1
+            rain_series.append(s)
+
+    # Temperature discovery is retained only so the database/dashboard can
+    # see that this production scanner intentionally ignores temperature.
+    # Precipitation is different: KXRAIN is a multi-city daily event family,
+    # so the city must be mapped from each market ticker, not from the series
+    # title. This avoids the fatal old assumption that KXRAIN itself names a
+    # single city.
+    rains=[];seen=set();seen_markets=set()
+    rain_suffix={'NYC':'NYC','CHI':'CHI','MIA':'MIA','LAX':'LAX','DEN':'DEN',
+                 'PHIL':'PHIL','DC':'DC','BOS':'BOS','DAL':'DAL','HOU':'HOU'}
+    for s in rain_series:
+        ticker=(s.get('ticker') or '').upper()
+        try:
+            ms=markets(ticker)
+        except Exception as e:
+            skipped_rain+=1
+            log.warning('RAIN SERIES SKIP | ticker=%s | reason=market_fetch_failed | error=%s',ticker,e)
+            continue
+        s=dict(s)
+        s['_preloaded_markets']=ms
+        for m in ms:
+            mt=(m.get('ticker') or '').upper()
+            suffix=mt.rsplit('-',1)[-1]
+            key=rain_suffix.get(suffix)
+            if key is None:
+                continue
+            l=getloc(key)
+            if not l:
+                skipped_rain+=1
+                continue
+            if mt in seen_markets:
+                continue
+            seen_markets.add(mt)
+            pair=(ticker,l['location_key'])
+            if pair not in seen:
+                seen.add(pair);rains.append((s,l))
     if skipped_temp or skipped_rain:
-        log.warning('MAPPING SUMMARY | temperature_series_skipped=%d | rain_series_skipped=%d (see MAPPING SKIP lines above for which tickers and why)',skipped_temp,skipped_rain)
+        log.warning('MAPPING SUMMARY | temperature_series_skipped=%d | rain_series_or_locations_skipped=%d',skipped_temp,skipped_rain)
+
+    # Keep one canonical temperature entry per mapped city, though production
+    # signal generation never iterates the temperature cache.
     by={}
-    for s,l in temps:
-        by.setdefault(l['location_key'],[]).append((s,l))
+    for s,l in temps:by.setdefault(l['location_key'],[]).append((s,l))
     temps=[]
     for k,es in sorted(by.items()):
-        es.sort(key=lambda z:(0 if (z[0].get('ticker') or '').upper().startswith('KXHIGH') else 1,z[0].get('ticker') or ''));temps.append(es[0])
-    unique_rains=[]
-    for e in rains:
-        ticker=e[0].get('ticker')
-        if ticker and ticker not in seen_r:
-            seen_r.add(ticker); unique_rains.append(e)
-    rains=unique_rains
-    return temps,rains
+        es.sort(key=lambda z:(0 if (z[0].get('ticker') or '').upper().startswith('KXHIGH') else 1,z[0].get('ticker') or ''))
+        temps.append(es[0])
+    return [],rains
 
 def markets(ticker):
     out=[];cur=None
@@ -433,7 +467,23 @@ def date_market(m):
     log.warning('MAPPING SKIP | ticker=%s | event_ticker=%s | reason=unparseable_date_in_ticker',m.get('ticker'),m.get('event_ticker'))
     return None
 
-def cache(entries): return [(s,l,markets(s.get('ticker'))) for s,l in entries]
+def cache(entries, fresh=False):
+    out=[]
+    for s,l in entries:
+        # The discovery pass may preload open KXRAIN markets.  For the
+        # forecast-event snapshot we deliberately bypass that preload and make
+        # a fresh market-data request so the quote used for the signal is the
+        # quote observed after the weather-model fetch.
+        ms=None if fresh else s.get('_preloaded_markets')
+        if ms is None:ms=markets(s.get('ticker'))
+        # Keep only markets that actually map to this location.
+        if l and (s.get('ticker') or '').upper().startswith('KXRAIN'):
+            ms=[m for m in ms if (m.get('ticker') or '').upper().rsplit('-',1)[-1] == _rain_key_for_location(l['location_key'])]
+        out.append((s,l,ms))
+    return out
+
+def _rain_key_for_location(location_key):
+    return {'NYC':'NYC','CHI':'CHI','MIA':'MIA','LAX':'LAX','DEN':'DEN','PHIL':'PHIL','DC':'DC','BOS':'BOS','DAL':'DAL','HOU':'HOU'}.get(location_key,'')
 
 def snapshot(cache,scan_id,phase,stats,count_markets=False):
     rows=[]
@@ -488,68 +538,84 @@ def rules_text(m):
     return ' '.join(str(m.get(k) or '') for k in ('rules_primary','rules_secondary','title','subtitle')).lower()
 
 def market_rules_verify_station(m, station):
-    """Require the live Kalshi market rules to identify the exact NWS settlement station.
+    text=' '.join(str(m.get(k) or '') for k in ('rules_primary','rules_secondary','title','subtitle')).lower()
+    st=str(station or '').lower()
+    return bool(st and st in text and ('national weather service' in text or 'nws' in text) and ('daily climate' in text or 'climate report' in text))
 
-    Kalshi's public API exposes rules_primary/rules_secondary on market objects. We do not
-    trust a hard-coded city-to-airport assumption for a paper signal; the active market
-    itself must mention the expected station and an NWS/Climate Report source.
-    """
-    if not station or not m: return False
-    txt=rules_text(m)
-    station_l=str(station).lower()
-    if station_l not in txt: return False
-    if 'national weather service' not in txt and 'nws' not in txt: return False
-    if 'daily climate' not in txt and 'climate report' not in txt: return False
-    return True
-
-def blended_temperature_members(gfs_members, nws_high):
-    vals=[f(v) for v in (gfs_members or []) if f(v) is not None]
-    nh=f(nws_high)
-    if len(vals)<MIN_ENSEMBLE_MEMBERS or nh is None: return []
-    med=statistics.median(vals)
-    return [nh + (v-med)*ENSEMBLE_DISPERSION_INFLATION for v in vals]
-
-def model_probability(cur_members, market, nws_high):
-    vals=blended_temperature_members(cur_members,nws_high)
-    if not vals: return None
-    return tprob(vals,market)
+def market_rules_verify_precipitation(m, station):
+    # Current KXRAIN daily markets resolve on the Weather Company data named
+    # in the rules.  The binary event is total precipitation strictly > 0 in.
+    text=' '.join(str(m.get(k) or '') for k in ('rules_primary','rules_secondary','title','subtitle')).lower()
+    st=str(station or '').lower()
+    station_ok=bool(st and st in text)
+    source_ok=('weather company' in text) or ('weather.com/kalshi' in text)
+    threshold_ok=('strictly greater than 0 inches' in text) or ('greater than 0 inches' in text)
+    return station_ok and source_ok and threshold_ok
 
 def calibration_probability(raw_probability, samples):
-    """Conservative empirical calibration from settled v12 research events.
+    """Monotone empirical calibration of the raw GFS event probability.
 
-    We use fixed probability bins with Laplace smoothing. This is deliberately simple,
-    auditable, and impossible to confuse with a model trained on future outcomes.
+    We bin historical forecast probabilities into 10-point bins, apply Laplace
+    smoothing, then fit a weighted monotone (isotonic) sequence with the pool-
+    adjacent-violators algorithm. This prevents a noisy historical sample from
+    turning a higher raw rain probability into a lower calibrated probability.
     """
     p=f(raw_probability)
-    if p is None or not samples: return None,0
+    if p is None or not samples:return None,0
     bins=[]
     for lo in range(0,100,10):
         hi=lo+10
         ys=[y for x,y in samples if lo <= x < hi]
         n=len(ys)
-        if n:
+        if n>=5:
             rate=(sum(ys)+1.0)/(n+2.0)
-            bins.append((lo+5,rate,n))
-    total=sum(n for _,_,n in bins)
-    if total < MIN_CALIBRATION_SAMPLES: return None,total
+            bins.append([lo+5,rate,n])
+    total=sum(int(b[2]) for b in bins)
+    if total<MIN_CALIBRATION_SAMPLES or len(bins)<3:return None,total
+
+    # Weighted PAVA: merge adjacent bins whenever the fitted rate decreases.
+    blocks=[{'x':[b[0]],'rate':b[1],'n':b[2]} for b in bins]
+    i=0
+    while i<len(blocks)-1:
+        if blocks[i]['rate']>blocks[i+1]['rate']:
+            n1=blocks[i]['n'];n2=blocks[i+1]['n']
+            merged_n=n1+n2
+            merged_rate=(blocks[i]['rate']*n1+blocks[i+1]['rate']*n2)/merged_n
+            blocks[i]={'x':blocks[i]['x']+blocks[i+1]['x'],'rate':merged_rate,'n':merged_n}
+            del blocks[i+1]
+            if i>0:i-=1
+        else:
+            i+=1
+
+    centers=[]
+    for b in blocks:
+        centers.append((sum(b['x'])/len(b['x']),b['rate']))
     x=min(99.999,max(0.0,p))
-    eligible=[b for b in bins if b[2]>=5]
-    if len(eligible)<3: return None,total
-    nearest=min(eligible,key=lambda b:abs(x-b[0]))
-    return nearest[1]*100.0,total
+    if x<=centers[0][0]:rate=centers[0][1]
+    elif x>=centers[-1][0]:rate=centers[-1][1]
+    else:
+        rate=centers[-1][1]
+        for (x1,r1),(x2,r2) in zip(centers,centers[1:]):
+            if x1<=x<=x2:
+                w=(x-x1)/(x2-x1) if x2>x1 else 0.0
+                rate=r1+w*(r2-r1)
+                break
+    return max(0.0,min(100.0,rate*100.0)),total
 
 def load_calibration_samples(before):
-    rows=q("""SELECT DISTINCT ON (market_ticker) current_probability,
-                    CASE WHEN (side='YES' AND settlement_result='yes') OR (side='NO' AND settlement_result='no') THEN 1.0 ELSE 0.0 END
+    rows=q("""SELECT DISTINCT ON (market_ticker) CASE WHEN side='YES' THEN current_probability ELSE 100.0-current_probability END,
+                    CASE WHEN settlement_result='yes' THEN 1.0 ELSE 0.0 END
              FROM forecast_research_events
-             WHERE measurement_version=%s AND status='settled' AND settlement_verified=TRUE AND forecast_observed_at<%s
+             WHERE measurement_version=%s AND variable='precipitation' AND status='settled' AND settlement_verified=TRUE AND forecast_observed_at<%s
                AND current_probability>=0 AND current_probability<=100
-               AND settlement_result IN ('yes','no')
+               AND side IN ('YES','NO') AND settlement_result IN ('yes','no')
              ORDER BY market_ticker, forecast_observed_at ASC
              LIMIT 10000""",(MEASUREMENT_VERSION,before),fetch=True) or []
     return [(f(p),f(y)) for p,y in rows if f(p) is not None and f(y) is not None]
 
 def contract_label(m):
+    if (m.get('series_ticker') or '').upper().startswith('KXRAIN') or (m.get('ticker') or '').upper().startswith('KXRAIN'):
+        return 'Precipitation > 0.00 inches (YES = rain)'
     st=(m.get('strike_type') or '').lower()
     lo=f(m.get('floor_strike'));hi=f(m.get('cap_strike'))
     if st=='between' and lo is not None and hi is not None:
@@ -562,7 +628,7 @@ def contract_label(m):
     if st=='less' and hi is not None:
         threshold=int(Decimal(str(hi)).to_integral_value(rounding=ROUND_HALF_UP))-1
         return f'{threshold}° or lower'
-    return 'Temperature contract (see ticker)'
+    return 'Precipitation contract'
 
 def tprob(vals,m):
     vals=[round_temp(v) for v in vals if round_temp(v) is not None];
@@ -573,8 +639,45 @@ def tprob(vals,m):
     elif st=='between':hits=sum(lo<=v<=hi for v in vals) if lo is not None and hi is not None else None
     else:return None
     return None if hits is None else 100*hits/len(vals)
-def rprob(vals):
-    vals=[f(v) for v in vals if f(v) is not None];return None if not vals else 100*sum(v>0 for v in vals)/len(vals)
+def rprob(vals, m=None):
+    vals=[f(v) for v in vals if f(v) is not None]
+    if not vals:return None
+    st=(m.get('strike_type') or '').lower() if isinstance(m,dict) else 'greater'
+    lo=f(m.get('floor_strike')) if isinstance(m,dict) else 0.0
+    hi=f(m.get('cap_strike')) if isinstance(m,dict) else None
+    # KXRAIN's production contract is precipitation strictly > 0 inches.
+    # Support only that exact binary form in paper trading; research will also
+    # reject anything else through the rule gate.
+    if st in {'greater',''}:
+        threshold=0.0 if lo is None else lo
+        hits=sum(v>threshold for v in vals)
+    elif st=='less':
+        threshold=0.0 if hi is None else hi
+        hits=sum(v<threshold for v in vals)
+    elif st=='between' and lo is not None and hi is not None:
+        hits=sum(lo<=v<=hi for v in vals)
+    else:
+        return None
+    return 100.0*hits/len(vals)
+
+def blended_rain_probability(member_vals, nws_pop, m=None):
+    # Kept as a compatibility wrapper for stored/research code, but deliberately
+    # DO NOT blend NWS PoP into the Kalshi settlement probability. NWS PoP and
+    # the Kalshi event are not necessarily defined on the same precipitation
+    # threshold/time window. The GFS ensemble is the model probability; NWS is
+    # used only as an independent direction-confirmation gate.
+    return rprob(member_vals,m)
+
+def nws_rain_confirms_direction(location_key,date,rain_change,before):
+    l=getloc(location_key)
+    if not l:return None
+    city=l['city_name']
+    current=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_precip_probability_max' AND model='nws_grid' AND forecast_date=%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,MEASUREMENT_VERSION),one=True)
+    previous=q("SELECT scalar_value FROM forecast_observations WHERE city=%s AND variable='nws_precip_probability_max' AND model='nws_grid' AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1",(city,date,before,MEASUREMENT_VERSION),one=True)
+    if not current or not previous or current[0] is None or previous[0] is None:return None
+    change=current[0]-previous[0]
+    if abs(change)<MIN_RAIN_NWS_POP_CONFIRMATION_POINTS:return None
+    return (change>0)==(rain_change>0)
 
 def forecast_prev(city,var,date,before):
     r=q('SELECT payload,observed_at FROM forecast_observations WHERE city=%s AND variable=%s AND model=%s AND forecast_date=%s AND observed_at<%s AND measurement_version=%s ORDER BY observed_at DESC,id DESC LIMIT 1',(city,var,ENSEMBLE_MODEL,date,before,MEASUREMENT_VERSION),one=True)
@@ -596,7 +699,7 @@ def forecast_revision_fingerprint(variable,payload):
         return h({'variable':variable,'model_run':run,'member_highs_rounded':vals})
     if variable=='ensemble_rain_distribution':
         vals=[1 if f(v) is not None and f(v)>0 else 0 for v in (payload.get('member_precip_totals') or [])]
-        return h({'variable':variable,'model_run':run,'member_wet_flags':vals})
+        return h({'variable':variable,'model_run':run,'member_wet_flags':vals,'nws_pop':f(payload.get('nws_precip_probability_max'))})
     return h({'variable':variable,'model_run':run})
 
 def forecast_payload_fingerprint(payload,variable=None):
@@ -605,9 +708,7 @@ def forecast_payload_fingerprint(payload,variable=None):
     return h(payload) if isinstance(payload,dict) else None
 
 def signal_allowed(l,kind,market_rules_verified=False):
-    if kind=='rain':
-        return bool(ALLOW_RAIN_PAPER_SIGNALS and market_rules_verified)
-    return bool(market_rules_verified)
+    return bool(kind=='rain' and ALLOW_RAIN_PAPER_SIGNALS and market_rules_verified)
 
 def save_forecasts(det,ens,observed,nws_grid=None):
     rows=[]
@@ -637,7 +738,8 @@ def save_forecasts(det,ens,observed,nws_grid=None):
                 'precipitation_member_count':d['precipitation_member_count'],
                 'model_run':d.get('model_run'),
                 'location_key':k,
-                'nws_temperature_high':((nws_grid or {}).get(k,{}).get('daily_high_f') or {}).get(date)
+                'nws_temperature_high':((nws_grid or {}).get(k,{}).get('daily_high_f') or {}).get(date),
+                'nws_precip_probability_max':((nws_grid or {}).get(k,{}).get('daily_pop_max') or {}).get(date)
             }
             temp_fp=forecast_revision_fingerprint('ensemble_temperature_distribution',p)
             rows.append((city,'ensemble_temperature_distribution',ENSEMBLE_MODEL,date,x['temperature_mean'],J(p),temp_fp,observed,MEASUREMENT_VERSION))
@@ -647,7 +749,8 @@ def save_forecasts(det,ens,observed,nws_grid=None):
                     'member_precip_totals':x['member_precip_totals'],
                     'precipitation_member_count':d['precipitation_member_count'],
                     'model_run':d.get('model_run'),
-                    'location_key':k
+                    'location_key':k,
+                    'nws_precip_probability_max':((nws_grid or {}).get(k,{}).get('daily_pop_max') or {}).get(date)
                 }
                 rain_fp=forecast_revision_fingerprint('ensemble_rain_distribution',p)
                 rows.append((city,'ensemble_rain_distribution',ENSEMBLE_MODEL,date,statistics.mean(x['member_precip_totals']),J(p),rain_fp,observed,MEASUREMENT_VERSION))
@@ -742,7 +845,8 @@ def fetch_ens(locs):
     p={'latitude':','.join(str(x['latitude']) for x in locs),'longitude':','.join(str(x['longitude']) for x in locs),'models':ENSEMBLE_MODEL,'hourly':'temperature_2m,precipitation','temperature_unit':'fahrenheit','precipitation_unit':'inch','timezone':'UTC','forecast_days':FORECAST_DAYS};data=http('https://ensemble-api.open-meteo.com/v1/ensemble',p);out={}
     for l,d in norm(data,locs):
         x=d.get('hourly') or {};ts=x.get('time') or [];tk=sorted(k for k in x if k.startswith('temperature_2m_member'));pk=sorted(k for k in x if k.startswith('precipitation_member'));days=defaultdict(lambda:{'t':defaultdict(list),'p':defaultdict(float)})
-        if len(tk)<MIN_ENSEMBLE_MEMBERS:raise RuntimeError(f'Only {len(tk)} ensemble temperature members for {l["city_name"]}; expected at least {MIN_ENSEMBLE_MEMBERS}')
+        if len(pk)<MIN_PRECIP_ENSEMBLE_MEMBERS:
+            raise RuntimeError(f'Only {len(pk)} precipitation ensemble members for {l["city_name"]}; expected at least {MIN_PRECIP_ENSEMBLE_MEMBERS}')
         for i,t in enumerate(ts):
             day=settlement_date_for_ts(t,l['timezone'])
             for k in tk:
@@ -753,10 +857,19 @@ def fetch_ens(locs):
                 if i<len(a) and f(a[i]) is not None:days[day]['p'][k]+=f(a[i])
         daily={}
         for day,v in days.items():
-            highs=[max(a) for a in v['t'].values() if a];rain=list(v['p'].values())
-            if highs:daily[day]={'member_highs':highs,'member_precip_totals':rain,'temperature_mean':statistics.mean(highs),'temperature_median':statistics.median(highs)}
+            highs=[max(a) for a in v['t'].values() if a]
+            rain=list(v['p'].values())
+            # Production signals are precipitation-only.  Do not discard a
+            # valid rain day merely because a temperature member is missing.
+            if rain:
+                daily[day]={
+                    'member_highs':highs,
+                    'member_precip_totals':rain,
+                    'temperature_mean':statistics.mean(highs) if highs else None,
+                    'temperature_median':statistics.median(highs) if highs else None,
+                }
         out[l['location_key']]={'daily':daily,'temperature_member_count':len(tk),'precipitation_member_count':len(pk),'model_run':d.get('model_run') or d.get('model_run_id') or d.get('model_run_time')}
-    missing=[l['city_name'] for l in locs if l['location_key'] not in out or not out[l['location_key']]['daily']]
+    missing=[l['city_name'] for l in locs if l['location_key'] not in out or not out[l['location_key']]['daily'] or out[l['location_key']]['precipitation_member_count'] < MIN_PRECIP_ENSEMBLE_MEMBERS]
     if missing:raise RuntimeError('Ensemble missing daily temperature data for: '+', '.join(missing))
     return out
 
@@ -870,7 +983,7 @@ def create_research(l,date,var,m,prevp,curp,preask,eventask,scan,observed,stats,
     r=q("""INSERT INTO forecast_research_events(event_fingerprint,created_at,city,forecast_date,variable,market_ticker,side,previous_probability,current_probability,forecast_probability_change_points,pre_forecast_ask_cents,event_ask_cents,initial_market_change_points,initial_market_lag_points,initial_preliminary_edge_points,status,scan_id,forecast_observed_at,measurement_version,settlement_verified,location_key) VALUES(%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(event_fingerprint) DO NOTHING RETURNING id""",(fp,l['city_name'],date,var,m.get('ticker',''),side,prev_side,cur_side,side_ch,preask,eventask,market_ch,lag,edge,'open' if lag>0 else 'no_initial_lag',scan,observed,MEASUREMENT_VERSION,bool(market_rules_verified),l['location_key']),one=True)
     if r:stats['research_events_created']+=1
 
-def process_research(cache,ens,before,scan,observed,stats):
+def process_research(cache,ens,before,scan,observed,stats,nws_grid=None):
     # Cache repeated lookups. Each market in a city/date shares the same
     # previous ensemble forecast; each ticker shares the same market snapshots.
     # This avoids hundreds/thousands of redundant DB round trips on a scan.
@@ -906,7 +1019,8 @@ def process_research(cache,ens,before,scan,observed,stats):
                     current_payload={'member_highs':d.get('member_highs') or [],'member_highs_rounded':[round_temp(v) for v in (d.get('member_highs') or [])],'model_run':current_run}
                     variable_key='ensemble_temperature_distribution'
                 else:
-                    current_payload={'member_precip_totals':d.get('member_precip_totals') or [],'model_run':current_run}
+                    current_payload={'member_precip_totals':d.get('member_precip_totals') or [],'model_run':current_run,
+                                     'nws_precip_probability_max':((nws_grid or {}).get(l['location_key'],{}).get('daily_pop_max') or {}).get(date)}
                     variable_key='ensemble_rain_distribution'
 
                 current_fp=forecast_revision_fingerprint(variable_key,current_payload)
@@ -915,8 +1029,11 @@ def process_research(cache,ens,before,scan,observed,stats):
                     continue
 
                 prevvals=prev_payload.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
-                cp=probfun(curvals,m) if kind=='temperature' else probfun(curvals)
-                pp=probfun(prevvals,m) if kind=='temperature' else probfun(prevvals)
+                if kind=='temperature':
+                    cp=probfun(curvals,m); pp=probfun(prevvals,m)
+                else:
+                    cp=rprob(curvals,m)
+                    pp=rprob(prevvals,m)
                 if cp is None or pp is None:continue
                 stats['research_current_forecasts']+=1
                 stats['research_previous_forecasts']+=1
@@ -936,7 +1053,7 @@ def process_research(cache,ens,before,scan,observed,stats):
                 pa=pm[2] if side=='YES' else pm[4]
                 ea=em[2] if side=='YES' else em[4]
                 if pa is not None and ea is not None:
-                    create_research(l,date,'temperature' if kind=='temperature' else 'precipitation',m,pp,cp,pa,ea,scan,observed,stats,market_rules_verify_station(m,l.get('settlement_station')))
+                    create_research(l,date,'precipitation',m,pp,cp,pa,ea,scan,observed,stats,market_rules_verify_precipitation(m,l.get('settlement_station')))
 
 def contract_is_aligned(l,m,date,kind):
     """Fail closed unless the market is a daily high/precip contract for
@@ -970,20 +1087,28 @@ def contract_is_aligned(l,m,date,kind):
         return False
     return True
 
-def fee_cents_for_buy(price_cents,series_meta):
+def paper_contract_count(price_cents):
+    price=f(price_cents)
+    if price is None or price<=0:return 1
+    return max(1,int(PAPER_RISK_DOLLARS/(price/100.0)))
+
+def fee_cents_for_buy(price_cents,series_meta,contracts=None):
     p=max(0.0,min(1.0,f(price_cents)/100.0))
     ft=str((series_meta or {}).get('fee_type') or '').lower()
     mult=f((series_meta or {}).get('fee_multiplier'))
-    if ft=='quadratic' and mult is not None:
-        return 100.0*mult*p*(1.0-p)
-    # Weather paper signals must not silently assume an unknown fee schedule.
-    return None
+    if ft!='quadratic' or mult is None:return None
+    c=paper_contract_count(price_cents) if contracts is None else max(1,int(contracts))
+    # Kalshi's quadratic taker fee is rounded UP to the next cent on the
+    # aggregate trade.  Return the conservative per-contract equivalent.
+    raw_dollars=mult*c*p*(1.0-p)
+    total_cents=math.ceil(raw_dollars*100.0-1e-12)
+    return total_cents/c
 
 def max_entry_for_net_edge(model_prob_pct,series_meta,min_net_edge_cents):
     p=max(0.0,min(1.0,f(model_prob_pct)/100.0))
     lo,hi=0.0,100.0
     if fee_cents_for_buy(hi,series_meta) is None:return None
-    for _ in range(50):
+    for _ in range(60):
         mid=(lo+hi)/2.0
         fee=fee_cents_for_buy(mid,series_meta)
         net=p*100.0-mid-fee
@@ -993,22 +1118,25 @@ def max_entry_for_net_edge(model_prob_pct,series_meta,min_net_edge_cents):
 
 def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None,calibration_samples=None,market_rules_verified=False,series_meta=None):
     if not contract_is_aligned(l,m,date,kind):return None
-    if kind=='temperature' and not market_rules_verified:return None
+    if kind!='precipitation' or not market_rules_verified:return None
     if cp is None or pp is None or not pm or not em or abs(cp-pp)<MIN_FORECAST_PROBABILITY_CHANGE_POINTS:return None
     if not signal_allowed(l,'rain' if kind=='precipitation' else 'temperature',market_rules_verified):return None
-    # NWS confirmation gate: only fire temperature signals when the official
-    # NWS gridpoint forecast (human/station-bias-adjusted) is also moving in
+    # NWS confirmation gate: require the official NWS gridpoint precipitation
+    # probability forecast to move in the same direction as the GFS ensemble.
     # the same direction as the raw GFS ensemble shift. This cuts down on
     # signals that are just lag/noise in the Open-Meteo mirror rather than a
     # real forecast change. See fetch_nws_grid_values()/nws_confirms_direction().
     # Fail closed.  When NWS confirmation is required, ONLY an explicit
     # True confirmation may produce a temperature paper signal.  False means
     # NWS disagrees; None means we do not have comparable official data.
-    if kind=='temperature' and REQUIRE_NWS_CONFIRMATION and nws_confirms is not True:
+    if kind=='precipitation' and REQUIRE_NWS_CONFIRMATION and nws_confirms is not True:
         return None
     best=None
     raw_forecast_change=cp-pp
     sides=('YES',) if raw_forecast_change>0 else ('NO',)
+    # cp/pp are raw GFS ensemble probabilities for the exact >0-inch
+    # daily precipitation event. Calibration maps those probabilities to
+    # observed settlement frequencies; NWS is not mixed into the probability.
     calibrated_cp,ncal=calibration_probability(cp,calibration_samples or [])
     if calibrated_cp is None:return None
     calibrated_pp,_=calibration_probability(pp,calibration_samples or [])
@@ -1023,13 +1151,14 @@ def candidate(l,date,m,cp,pp,pm,em,kind='temperature',nws_confirms=None,calibrat
         sch=abs(forecast_change)
         mc=ask-prev
         lag=sch-mc
-        fee=fee_cents_for_buy(ask,series_meta)
+        contracts=paper_contract_count(ask)
+        fee=fee_cents_for_buy(ask,series_meta,contracts)
         max_entry=max_entry_for_net_edge(sp,series_meta,MIN_MODEL_EDGE_AFTER_FEES)
         if fee is None or max_entry is None:continue
         net_edge=sp-ask-fee
         edge=net_edge
         if lag<MIN_MARKET_LAG_POINTS or edge<MIN_MODEL_EDGE_AFTER_FEES or ask>max_entry:continue
-        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':max_entry,'preliminary_edge_points':edge,'raw_model_probability_proxy':cp,'calibration_samples':ncal,'estimated_fee_cents':fee,'fee_type':(series_meta or {}).get('fee_type'),'fee_multiplier':f((series_meta or {}).get('fee_multiplier')),'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':calibrated_pp,'forecast_current_probability':calibrated_cp,'raw_forecast_previous_probability':pp,'raw_forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m),'nws_confirmed':nws_confirms,'settlement_station':l.get('settlement_station'),'settlement_station_name':l.get('settlement_station_name'),'settlement_source':l.get('settlement_source')}
+        z={'city':l['city_name'],'forecast_date':date,'market_ticker':m.get('ticker',''),'market_kind':kind,'side':side,'entry_price_cents':ask,'model_probability_proxy':sp,'max_profitable_entry_cents':max_entry,'preliminary_edge_points':edge,'raw_model_probability_proxy':cp,'calibration_samples':ncal,'estimated_fee_cents':fee,'paper_contracts':contracts,'fee_type':(series_meta or {}).get('fee_type'),'fee_multiplier':f((series_meta or {}).get('fee_multiplier')),'forecast_probability_change_points':sch,'market_price_change_points':mc,'market_lag_points':lag,'forecast_temperature_change_f':None,'forecast_previous_probability':calibrated_pp,'forecast_current_probability':calibrated_cp,'raw_forecast_previous_probability':pp,'raw_forecast_current_probability':cp,'market_observed_at':em[0],'yes_bid_cents':em[1],'yes_ask_cents':em[2],'no_bid_cents':em[3],'no_ask_cents':em[4],'last_price_cents':em[5],'spread_yes_cents':em[6],'spread_no_cents':em[7],'volume':em[8],'open_interest':em[9],'event_ticker':em[10],'series_ticker':em[11],'contract_label':contract_label(m),'nws_confirmed':nws_confirms,'settlement_station':l.get('settlement_station'),'settlement_station_name':l.get('settlement_station_name'),'settlement_source':l.get('settlement_source')}
         valid,why=validate_signal_invariant(z)
         if not valid:
             log.error(
@@ -1072,7 +1201,8 @@ def validate_signal_invariant(signal):
         if expected_ask is None:
             return False, f'missing_{side.lower()}_ask'
 
-        expected_fee=f(signal.get('estimated_fee_cents'))
+        expected_contracts=paper_contract_count(entry)
+        expected_fee=fee_cents_for_buy(entry,{'fee_type':'quadratic','fee_multiplier':f(signal.get('fee_multiplier'))},expected_contracts) if signal.get('fee_multiplier') is not None else f(signal.get('estimated_fee_cents'))
         expected_edge=expected_prob-expected_ask-expected_fee if expected_fee is not None else None
 
         # Tight numerical tolerance only for floating-point representation.
@@ -1134,7 +1264,7 @@ def paper(signal,reason,stats):
         nws_line='NWS official forecast: **does not confirm** this move ⚠️\n'
     elif signal.get('nws_confirmed') is None:
         nws_line='NWS official forecast: no comparable data this run\n'
-    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**SETTLEMENT STATION: {signal.get('settlement_station_name','unknown')} ({signal.get('settlement_station','?')})**\n**CONTRACT: {signal.get('contract_label','Temperature contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nCalibrated model probability: **{signal['model_probability_proxy']:.1f}%**\nRaw ensemble/NWS probability: **{signal.get('raw_model_probability_proxy',signal['model_probability_proxy']):.1f}%**\nCalibration samples: **{signal.get('calibration_samples',0)}**\n💰 **Maximum entry for +{MIN_MODEL_EDGE_AFTER_FEES:.0f}¢ net edge after estimated fee: {signal['max_profitable_entry_cents']:.1f}¢**\nEstimated taker fee at ask: **{signal.get('estimated_fee_cents',0):.2f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — the signal passed the live-market rule check, empirical calibration gate, NWS confirmation gate, and fee-adjusted EV gate. No real order is submitted.")
+    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**SETTLEMENT STATION: {signal.get('settlement_station_name','unknown')} ({signal.get('settlement_station','?')})**\n**CONTRACT: {signal.get('contract_label','Precipitation contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nCalibrated model probability: **{signal['model_probability_proxy']:.1f}%**\nRaw GFS ensemble probability: **{signal.get('raw_model_probability_proxy',signal['model_probability_proxy']):.1f}%**\nCalibration samples: **{signal.get('calibration_samples',0)}**\n💰 **Maximum entry for +{MIN_MODEL_EDGE_AFTER_FEES:.0f}¢ net edge after estimated fee: {signal['max_profitable_entry_cents']:.1f}¢**\nEstimated taker fee at ask: **{signal.get('estimated_fee_cents',0):.2f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — precipitation-only signal. It passed the exact Weather Company/Kalshi rule check, empirical calibration gate, NWS confirmation gate, and fee-adjusted EV gate. No real order is submitted.")
     try:
         r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/8.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
         if r is not None and 200<=r.status_code<300:
@@ -1260,13 +1390,9 @@ def run_scan():
         ens={}
         observed=now()
 
-        if ch:
-            try:
-                det=fetch_det(list(locs.values()))
-                stats['deterministic_gfs_ok']=True
-            except Exception as e:
-                log.warning('Deterministic GFS unavailable: %s',e)
-        t=phase('fetch_det',t)
+        # Precipitation-only production mode: deterministic temperature GFS is not fetched.
+        det={}
+        t=phase('fetch_det_skipped_precip_only',t)
 
         try:
             stats['ensemble_fetch_attempted']=True
@@ -1284,10 +1410,10 @@ def run_scan():
 
         if ens:
             stats['weather_refreshed']=True
-            event_cache={'temperature':cache(te),'rain':cache(re)}
+            event_cache={'temperature':[],'rain':cache(re,fresh=True)}
             snapshot(event_cache,scan,'forecast_event',stats,count_markets=False)
             t=phase('event_snapshot',t)
-            process_research(event_cache,ens,started,scan,observed,stats)
+            process_research(event_cache,ens,started,scan,observed,stats,nws_grid)
             t=phase('process_research',t)
 
             # Cache repeated DB lookups. Every market in the same city/date
@@ -1298,9 +1424,7 @@ def run_scan():
             event_cache_lookup={}
             nws_confirmation_cache={}
 
-            for kind,entries in [('temperature',c['temperature']),('rain',c['rain'])]:
-                if kind=='rain' and not ALLOW_RAIN_PAPER_SIGNALS:
-                    continue
+            for kind,entries in [('rain',c['rain'])]:
                 for s,l,ms in entries:
                     variable_key='ensemble_temperature_distribution' if kind=='temperature' else 'ensemble_rain_distribution'
                     for m in ms:
@@ -1319,13 +1443,11 @@ def run_scan():
 
                         prev_payload=prev['payload'] or {}
                         old=prev_payload.get('member_highs' if kind=='temperature' else 'member_precip_totals') or []
-                        if kind=='temperature':
-                            current_nws=((nws_grid.get(l['location_key'],{}).get('daily_high_f') or {}).get(date))
-                            cp=model_probability(cur,m,current_nws)
-                            pp=model_probability(old,m,prev_payload.get('nws_temperature_high'))
-                            rules_verified=market_rules_verify_station(m,l.get('settlement_station'))
-                        else:
-                            cp=rprob(cur); pp=rprob(old); rules_verified=False
+                        current_pop=((nws_grid.get(l['location_key'],{}).get('daily_pop_max') or {}).get(date))
+                        previous_pop=f(prev_payload.get('nws_precip_probability_max'))
+                        cp=blended_rain_probability(cur,current_pop,m)
+                        pp=blended_rain_probability(old,previous_pop,m)
+                        rules_verified=market_rules_verify_precipitation(m,l.get('settlement_station'))
                         ticker=m.get('ticker','')
 
                         if ticker not in prior_cache:
@@ -1337,13 +1459,13 @@ def run_scan():
                         em=event_cache_lookup[ticker]
 
                         nws_confirms=None
-                        if kind=='temperature' and cp is not None and pp is not None:
+                        if cp is not None and pp is not None:
                             nkey=(l['location_key'],date)
                             if nkey not in nws_confirmation_cache:
-                                nws_confirmation_cache[nkey]=nws_confirms_direction(l['location_key'],date,cp-pp,started)
+                                nws_confirmation_cache[nkey]=nws_rain_confirms_direction(l['location_key'],date,cp-pp,started)
                             nws_confirms=nws_confirmation_cache[nkey]
 
-                        sig=candidate(l,date,m,cp,pp,pm,em,kind='temperature' if kind=='temperature' else 'precipitation',nws_confirms=nws_confirms,calibration_samples=calibration_samples,market_rules_verified=rules_verified,series_meta=s)
+                        sig=candidate(l,date,m,cp,pp,pm,em,kind='precipitation',nws_confirms=nws_confirms,calibration_samples=calibration_samples,market_rules_verified=rules_verified,series_meta=s)
                         if sig:
                             stats['forecast_shocks']+=1
                             if kind=='rain':
