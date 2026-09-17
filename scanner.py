@@ -561,7 +561,11 @@ def calibration_probability(raw_probability, samples):
     turning a higher raw rain probability into a lower calibrated probability.
     """
     p=f(raw_probability)
-    if p is None or not samples:return None,0
+    if p is None:return None,0
+    # Paper trading/Discord are allowed before the calibration dataset reaches
+    # the full empirical-calibration threshold. Until then, use the raw GFS
+    # ensemble probability and clearly label the signal as uncalibrated.
+    if not samples:return p,0
     bins=[]
     for lo in range(0,100,10):
         hi=lo+10
@@ -571,7 +575,7 @@ def calibration_probability(raw_probability, samples):
             rate=(sum(ys)+1.0)/(n+2.0)
             bins.append([lo+5,rate,n])
     total=sum(int(b[2]) for b in bins)
-    if total<MIN_CALIBRATION_SAMPLES or len(bins)<3:return None,total
+    if total<MIN_CALIBRATION_SAMPLES or len(bins)<3:return p,len(samples)
 
     # Weighted PAVA: merge adjacent bins whenever the fitted rate decreases.
     blocks=[{'x':[b[0]],'rate':b[1],'n':b[2]} for b in bins]
@@ -1264,7 +1268,7 @@ def paper(signal,reason,stats):
         nws_line='NWS official forecast: **does not confirm** this move ⚠️\n'
     elif signal.get('nws_confirmed') is None:
         nws_line='NWS official forecast: no comparable data this run\n'
-    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**SETTLEMENT STATION: {signal.get('settlement_station_name','unknown')} ({signal.get('settlement_station','?')})**\n**CONTRACT: {signal.get('contract_label','Precipitation contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nCalibrated model probability: **{signal['model_probability_proxy']:.1f}%**\nRaw GFS ensemble probability: **{signal.get('raw_model_probability_proxy',signal['model_probability_proxy']):.1f}%**\nCalibration samples: **{signal.get('calibration_samples',0)}**\n💰 **Maximum entry for +{MIN_MODEL_EDGE_AFTER_FEES:.0f}¢ net edge after estimated fee: {signal['max_profitable_entry_cents']:.1f}¢**\nEstimated taker fee at ask: **{signal.get('estimated_fee_cents',0):.2f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — precipitation-only signal. It passed the exact Weather Company/Kalshi rule check, empirical calibration gate, NWS confirmation gate, and fee-adjusted EV gate. No real order is submitted.")
+    msg=(f"🌦️ **{signal['market_kind'].upper()} FORECAST SHOCK — PAPER TRADE**\n\n**{signal['city']} — {signal['forecast_date']}**\n**SETTLEMENT STATION: {signal.get('settlement_station_name','unknown')} ({signal.get('settlement_station','?')})**\n**CONTRACT: {signal.get('contract_label','Precipitation contract')}**\n**ACTION: BUY {signal['side']}**\nMarket ticker: `{market_ticker}`\nEntry ask: **{signal['entry_price_cents']:.1f}¢**\nQuote observed (UTC): `{observed_text}`\nYES bid/ask: **{fmt(signal.get('yes_bid_cents'))} / {fmt(signal.get('yes_ask_cents'))}**\nNO bid/ask: **{fmt(signal.get('no_bid_cents'))} / {fmt(signal.get('no_ask_cents'))}**\nLast trade: **{fmt(signal.get('last_price_cents'))}**\n{nws_line}\nModel probability used: **{signal['model_probability_proxy']:.1f}%**\nRaw GFS ensemble probability: **{signal.get('raw_model_probability_proxy',signal['model_probability_proxy']):.1f}%**\nCalibration samples: **{signal.get('calibration_samples',0)}**\n💰 **Maximum entry for +{MIN_MODEL_EDGE_AFTER_FEES:.0f}¢ net edge after estimated fee: {signal['max_profitable_entry_cents']:.1f}¢**\nEstimated taker fee at ask: **{signal.get('estimated_fee_cents',0):.2f}¢**\n\nForecast change: **{signal['forecast_probability_change_points']:+.1f} pts**\nMarket ask change: **{signal['market_price_change_points']:+.1f} pts**\nEstimated lag: **{signal['market_lag_points']:+.1f} pts**\nPreliminary edge: **{signal['preliminary_edge_points']:+.1f} pts**\n\nPaper risk: **${PAPER_RISK_DOLLARS:.2f}**\n\n🔗 **Kalshi market:** {market_url}\n\n⚠️ **PAPER TRADE ONLY** — precipitation-only signal. It passed the exact Weather Company/Kalshi rule check, NWS confirmation gate, and fee-adjusted EV gate. Empirical calibration is still building; raw GFS probability is used until 200 validated samples are available. No real order is submitted.")
     try:
         r=requests.post(DISCORD_RELAY_URL,json={'secret':DISCORD_RELAY_SECRET,'message':msg},headers={'User-Agent':'WeatherKalshiResearchBot/8.0'},timeout=REQUEST_TIMEOUT) if DISCORD_RELAY_URL and DISCORD_RELAY_SECRET else None
         if r is not None and 200<=r.status_code<300:
