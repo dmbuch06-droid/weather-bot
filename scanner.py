@@ -83,22 +83,59 @@ def round_temp(v):
 def db():
     if not DATABASE_URL: raise RuntimeError('DATABASE_URL is not configured')
     if psycopg2 is None: raise RuntimeError('psycopg2-binary is not installed')
-    return psycopg2.connect(DATABASE_URL,connect_timeout=10)
+    last=None
+    # Render Postgres can occasionally close an SSL connection while GitHub
+    # Actions is opening it.  Treat that as a transient DB outage and retry
+    # with increasing delays instead of failing the entire scan immediately.
+    delays=(0,3,6,10,15,20)
+    for attempt,delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            return psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=15,
+                sslmode='require',
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+                application_name='weather-kalshi-research-scanner',
+            )
+        except psycopg2.OperationalError as e:
+            last=e
+    raise last
+
 def q(sql,p=(),fetch=False,one=False):
     global _DB_CONN
-    if _DB_CONN is None or _DB_CONN.closed:_DB_CONN=db()
-    try:
-        with _DB_CONN.cursor() as c:
-            c.execute(sql,p); r=c.fetchone() if one else (c.fetchall() if fetch else None)
-        # Read-only SELECTs do not need a commit. Avoiding a commit on every
-        # lookup is important because discovery/research performs many small
-        # reads per scan. Writes/DDL still commit immediately, preserving the
-        # existing error/transaction behavior.
-        if not sql.lstrip().upper().startswith('SELECT'):
-            _DB_CONN.commit()
-        return r
-    except Exception:
-        _DB_CONN.rollback(); raise
+    # Retry an individual query if the existing connection was dropped.
+    # This is especially important during schema() because Render may close
+    # an otherwise-open SSL connection between DDL statements.
+    for attempt in range(3):
+        if _DB_CONN is None or _DB_CONN.closed:
+            _DB_CONN=db()
+        try:
+            with _DB_CONN.cursor() as c:
+                c.execute(sql,p)
+                r=c.fetchone() if one else (c.fetchall() if fetch else None)
+            if not sql.lstrip().upper().startswith('SELECT'):
+                _DB_CONN.commit()
+            return r
+        except psycopg2.OperationalError:
+            try:
+                _DB_CONN.close()
+            except Exception:
+                pass
+            _DB_CONN=None
+            if attempt >= 2:
+                raise
+            time.sleep(2*(attempt+1))
+        except Exception:
+            try:
+                _DB_CONN.rollback()
+            except Exception:
+                pass
+            raise
 def close_db():
     global _DB_CONN
     if _DB_CONN is not None and not _DB_CONN.closed:_DB_CONN.close()
@@ -1285,159 +1322,72 @@ def settle(stats):
         except Exception as e:log.warning('Could not settle %s: %s',ticker,e)
 
 def close_research_events(stats):
-    """Settle research events with one Kalshi lookup per unique ticker."""
-    rows=q("""
-        SELECT id,market_ticker
-        FROM forecast_research_events
-        WHERE measurement_version=%s
-          AND status IN ('open','no_initial_lag')
-        LIMIT 1000
-    """,(MEASUREMENT_VERSION,),fetch=True) or []
-    if not rows:
-        return
-
-    tickers=sorted({ticker for _,ticker in rows if ticker})
-    results={}
-    for ticker in tickers:
+    rows=q("SELECT id,market_ticker FROM forecast_research_events WHERE measurement_version=%s AND status IN ('open','no_initial_lag') LIMIT 1000",(MEASUREMENT_VERSION,),fetch=True) or []
+    for eid,ticker in rows:
         try:
             m=http(f'{KALSHI_API_URL}/markets/{ticker}',tries=1).get('market',{})
             res=(m.get('result') or '').lower()
             if res in {'yes','no'}:
-                results[ticker]=res
+                q("UPDATE forecast_research_events SET status='settled',closed_at=NOW(),settlement_result=%s WHERE id=%s AND status IN ('open','no_initial_lag')",(res,eid))
+                stats['research_events_settled']=stats.get('research_events_settled',0)+1
         except Exception as e:
-            log.warning('Could not settle research ticker %s: %s',ticker,e)
-
-    updates=[(res,eid,ticker) for eid,ticker in rows if (res:=results.get(ticker))]
-    if not updates:
-        return
-
-    global _DB_CONN
-    if _DB_CONN is None or _DB_CONN.closed:
-        _DB_CONN=db()
-    try:
-        with _DB_CONN.cursor() as c:
-            c.executemany(
-                """UPDATE forecast_research_events
-                   SET status='settled',closed_at=NOW(),settlement_result=%s
-                   WHERE id=%s AND market_ticker=%s
-                     AND status IN ('open','no_initial_lag')""",
-                updates
-            )
-        _DB_CONN.commit()
-    except Exception:
-        _DB_CONN.rollback()
-        raise
-    stats['research_events_settled']=stats.get('research_events_settled',0)+len(updates)
-
+            log.warning('Could not settle research event %s/%s: %s',eid,ticker,e)
 
 def observe(stats,before):
-    """Observe open research events using one batched snapshot query.
-
-    The old implementation performed a SELECT + UPDATE + INSERT for every
-    event. With hundreds of open events that turned one scan into hundreds of
-    DB round trips. This version fetches the next eligible scan_start snapshot
-    for every event in one query, then writes the resulting updates in batches.
-    """
-    rows=q("""
-        SELECT e.id,e.market_ticker,e.side,e.created_at,e.event_ask_cents,
-               e.initial_market_lag_points,e.latest_observation_at,
-               e.max_market_move_points,
-               s.observed_at,s.scan_id,s.ticker,s.event_ticker,s.series_ticker,
-               s.yes_bid_cents,s.yes_ask_cents,s.no_bid_cents,s.no_ask_cents,
-               s.last_price_cents,s.spread_yes_cents,s.spread_no_cents,
-               s.volume,s.open_interest
-        FROM forecast_research_events e
-        JOIN LATERAL (
+    rows=q("SELECT id,market_ticker,side,created_at,event_ask_cents,initial_market_lag_points,latest_observation_at,max_market_move_points FROM forecast_research_events WHERE measurement_version=%s AND status='open' AND created_at<%s LIMIT 1000",(MEASUREMENT_VERSION,before),fetch=True) or []
+    for eid,ticker,side,created,event,lag,last,maxmove in rows:
+        r=q("""
             SELECT observed_at,scan_id,ticker,event_ticker,series_ticker,
                    yes_bid_cents,yes_ask_cents,no_bid_cents,no_ask_cents,
-                   last_price_cents,spread_yes_cents,spread_no_cents,
-                   volume,open_interest
-            FROM market_snapshots s
-            WHERE s.ticker=e.market_ticker
-              AND s.snapshot_phase='scan_start'
-              AND s.measurement_version=%s
-              AND s.observed_at>COALESCE(e.latest_observation_at,e.created_at)
-              AND s.observed_at<%s
-            ORDER BY s.observed_at,s.id
+                   last_price_cents,spread_yes_cents,spread_no_cents,volume,open_interest
+            FROM market_snapshots
+            WHERE ticker=%s AND snapshot_phase='scan_start'
+              AND measurement_version=%s AND observed_at>%s AND observed_at<%s
+            ORDER BY observed_at,id
             LIMIT 1
-        ) s ON TRUE
-        WHERE e.measurement_version=%s
-          AND e.status='open'
-          AND e.created_at<%s
-        ORDER BY e.id
-        LIMIT 1000
-    """,(MEASUREMENT_VERSION,before,MEASUREMENT_VERSION,before),fetch=True) or []
-
-    updates=[]
-    inserts=[]
-    logs=[]
-    for row in rows:
-        (eid,ticker,side,created,event,lag,last,maxmove,
-         observed_at,scan_id,ticker_value,event_ticker,series_ticker,
-         yes_bid,yes_ask,no_bid,no_ask,last_price,spread_yes,spread_no,
-         volume,open_interest)=row
+        """,(ticker,MEASUREMENT_VERSION,last or created,before),one=True)
+        if not r or r[1] is None:
+            continue
+        (observed_at,scan_id,ticker_value,event_ticker,series_ticker,
+         yes_bid,yes_ask,no_bid,no_ask,last_price,spread_yes,spread_no,volume,open_interest)=r
         current_ask=yes_ask if side=='YES' else no_ask
-        if current_ask is None or scan_id is None:
+        if current_ask is None:
             continue
         move=current_ask-event
         frac=move/lag if lag and lag>0 else 0
         remaining=lag-move if lag is not None else None
         max_move_new=max(maxmove or 0,move)
-        updates.append((
-            observed_at,current_ask,move,remaining,max_move_new,
-            move,observed_at,
-            move,move,observed_at,
-            move,move,observed_at,
-            move,move,observed_at,
-            move,move,observed_at,eid
-        ))
-        inserts.append((
-            eid,observed_at,current_ask,move,remaining,frac,scan_id,ticker_value,
-            event_ticker,series_ticker,yes_bid,yes_ask,no_bid,no_ask,last_price,
-            spread_yes,spread_no,volume,open_interest
-        ))
-        logs.append((ticker_value,side,observed_at,scan_id,yes_bid,yes_ask,
-                     no_bid,no_ask,last_price,volume))
-
-    if not updates:
-        return
-
-    global _DB_CONN
-    if _DB_CONN is None or _DB_CONN.closed:
-        _DB_CONN=db()
-    try:
-        with _DB_CONN.cursor() as c:
-            c.executemany("""
-                UPDATE forecast_research_events
-                SET latest_observation_at=%s,
-                    latest_ask_cents=%s,
-                    latest_market_move_points=%s,
-                    latest_lag_remaining_points=%s,
-                    max_market_move_points=%s,
-                    first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,
-                    milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,
-                    milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,
-                    milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,
-                    milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END
-                WHERE id=%s
-            """,updates)
-            c.executemany("""
-                INSERT INTO forecast_research_updates(
-                    event_id,observed_at,market_ask_cents,market_move_points,
-                    lag_remaining_points,market_response_fraction,scan_id,ticker,
-                    event_ticker,series_ticker,yes_bid_cents,yes_ask_cents,
-                    no_bid_cents,no_ask_cents,last_price_cents,spread_yes_cents,
-                    spread_no_cents,volume,open_interest
-                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,inserts)
-        _DB_CONN.commit()
-    except Exception:
-        _DB_CONN.rollback()
-        raise
-
-    stats['research_events_observed']+=len(updates)
-    for (ticker_value,side,observed_at,scan_id,yes_bid,yes_ask,
-         no_bid,no_ask,last_price,volume) in logs:
+        q("""
+            UPDATE forecast_research_events
+            SET latest_observation_at=%s,
+                latest_ask_cents=%s,
+                latest_market_move_points=%s,
+                latest_lag_remaining_points=%s,
+                max_market_move_points=%s,
+                first_response_at=CASE WHEN first_response_at IS NULL AND %s>0 THEN %s ELSE first_response_at END,
+                milestone_25_at=CASE WHEN milestone_25_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.25 THEN %s ELSE milestone_25_at END,
+                milestone_50_at=CASE WHEN milestone_50_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.50 THEN %s ELSE milestone_50_at END,
+                milestone_75_at=CASE WHEN milestone_75_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.75 THEN %s ELSE milestone_75_at END,
+                milestone_90_at=CASE WHEN milestone_90_at IS NULL AND %s>0 AND %s>=initial_market_lag_points*.90 THEN %s ELSE milestone_90_at END
+            WHERE id=%s
+        """,(observed_at,current_ask,move,remaining,max_move_new,
+             move,observed_at,
+             move,move,observed_at,
+             move,move,observed_at,
+             move,move,observed_at,
+             move,move,observed_at,eid))
+        q("""
+            INSERT INTO forecast_research_updates(
+                event_id,observed_at,market_ask_cents,market_move_points,
+                lag_remaining_points,market_response_fraction,scan_id,ticker,
+                event_ticker,series_ticker,yes_bid_cents,yes_ask_cents,
+                no_bid_cents,no_ask_cents,last_price_cents,spread_yes_cents,
+                spread_no_cents,volume,open_interest
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,(eid,observed_at,current_ask,move,remaining,frac,scan_id,ticker_value,
+              event_ticker,series_ticker,yes_bid,yes_ask,no_bid,no_ask,last_price,
+              spread_yes,spread_no,volume,open_interest))
+        stats['research_events_observed']+=1
         log.info(
             'RESEARCH MARKET | %s | side=%s | observed=%s | scan=%s | YES %.1f/%.1f | NO %.1f/%.1f | last=%s | volume=%s',
             ticker_value,side,observed_at.isoformat(),scan_id,
@@ -1445,7 +1395,6 @@ def observe(stats,before):
             no_bid if no_bid is not None else float('nan'),no_ask if no_ask is not None else float('nan'),
             f'{last_price:.1f}c' if last_price is not None else 'n/a',
             f'{volume:.0f}' if volume is not None else 'n/a')
-
 
 def run_scan():
     stats={'schema_version':SCHEMA_VERSION,'measurement_version':MEASUREMENT_VERSION,'temperature_series':0,'rain_series':0,'temperature_markets':0,'rain_markets':0,'weather_refreshed':False,'forecast_shocks':0,'paper_trades_created':0,'discord_alerts':0,'settled_trades':0,'signals_rejected_invariant':0,'calibration_samples':0,'calibration_ready':False,'market_rule_rejections':0,'deterministic_gfs_ok':False,'ensemble_ok':False,'ensemble_fetch_attempted':False,'rain_forecast_shocks':0,'research_events_created':0,'research_events_observed':0,'research_markets_considered':0,'research_current_forecasts':0,'research_previous_forecasts':0,'research_missing_previous_forecast':0,'research_missing_previous_market':0,'research_missing_model_run':0,'research_events_settled':0,'nws_updates_detected':0,'nws_grid_values_saved':0,'phase_seconds':{}}
